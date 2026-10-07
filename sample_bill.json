@@ -1,0 +1,27 @@
+{
+  "title": "Hóa đơn siêu thị",
+  "commands": [
+    { "type": "text", "value": "CỬA HÀNG GHITA DEMO\n", "bold": true, "size": "2x", "align": "center" },
+    { "type": "text", "value": "Địa chỉ: Tầng 5, Tòa nhà Công Nghệ, Q.1\n", "align": "center" },
+    { "type": "divider", "style": "double" },
+    {
+      "type": "table",
+      "columns": [
+        { "title": "Sản phẩm", "width": 18, "align": "left" },
+        { "title": "SL", "width": 4, "align": "center" },
+        { "title": "Giá", "width": 10, "align": "right" }
+      ],
+      "rows": [
+        ["Trà đào cam sả", "2", "90.000đ"],
+        ["Bánh sừng bò", "1", "35.000đ"],
+        ["Cà phê muối", "1", "30.000đ"]
+      ]
+    },
+    { "type": "divider", "style": "solid" },
+    { "type": "text", "value": "TỔNG CỘNG: 155.000đ\n", "bold": true, "size": "2x", "align": "right" },
+    { "type": "qrcode", "value": "https://ghita.ai/pay/bill-0982", "size": 6 },
+    { "type": "text", "value": "Quét mã để thanh toán đơn hàng\n", "align": "center" },
+    { "type": "feed", "lines": 3 },
+    { "type": "cut", "partial": true }
+  ]
+}
