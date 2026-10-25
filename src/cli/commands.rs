@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "ghitaprint",
     author = "Ghita Team",
-    version = "0.0.0-preview",
+    version = env!("CARGO_PKG_VERSION"),
     about = "🖨️ Universal, Driverless & Ultra-fast Print Engine written in Rust",
     long_about = "GhitaPrint là bộ driver và công cụ điều khiển in ấn đa năng, kết nối mọi loại máy in mà không cần cài đặt driver thủ công."
 )]

@@ -12,7 +12,7 @@ pub fn install_startup() -> io::Result<String> {
     #[cfg(windows)]
     {
         let exe_path = std::env::current_exe()?;
-        let cmd = format!("\"{}\" daemon --silent", exe_path.display());
+        let cmd = format!("\"{}\" daemon --start", exe_path.display());
 
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (key, _) = hkcu.create_subkey(REG_RUN_PATH)?;

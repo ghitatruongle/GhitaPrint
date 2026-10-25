@@ -150,10 +150,11 @@ async fn main() {
                             "Đang xử lý ảnh {} qua thuật toán Floyd-Steinberg...",
                             img_path.display()
                         ));
-                        let mut raster_bytes = FloydSteinbergRasterizer::to_escpos_raster(
+                        let mut raster_bytes = vec![0x1B, 0x40];
+                        raster_bytes.extend(FloydSteinbergRasterizer::to_escpos_raster(
                             &img,
                             print_args.image_width,
-                        );
+                        ));
                         raster_bytes.extend_from_slice(&[0x1B, 0x64, 0x03]);
                         raster_bytes
                     }
@@ -421,7 +422,10 @@ async fn main() {
                     &settings.default_printer
                 }
             );
-            println!("  • Cổng Local API      : http://127.0.0.1:9123 (WebSocket + REST)");
+            println!(
+                "  • Cổng Local API      : http://127.0.0.1:{} (WebSocket + REST)",
+                settings.api_port
+            );
         }
     }
 }

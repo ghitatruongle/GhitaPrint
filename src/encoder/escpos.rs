@@ -89,8 +89,10 @@ impl EscPosBuilder {
     }
 
     pub fn barcode_128(&mut self, content: &str, height: u8) -> &mut Self {
-        let data = content.as_bytes();
-        let len = (data.len() + 2) as u8;
+        let data_all = content.as_bytes();
+        let usable = data_all.len().min(253);
+        let data = &data_all[..usable];
+        let len = (usable + 2) as u8;
 
         self.buffer.reserve(12 + data.len());
         self.buffer
@@ -104,8 +106,10 @@ impl EscPosBuilder {
     }
 
     pub fn qrcode(&mut self, content: &str, size: u8) -> &mut Self {
-        let data = content.as_bytes();
-        let len = (data.len() + 3) as u16;
+        let data_all = content.as_bytes();
+        let usable = data_all.len().min(u16::MAX as usize - 3);
+        let data = &data_all[..usable];
+        let len = (usable + 3) as u16;
         let p_l = (len & 0xFF) as u8;
         let p_h = ((len >> 8) & 0xFF) as u8;
 
@@ -233,6 +237,21 @@ mod tests {
         assert!(bytes.windows(3).any(|w| w == [0x1D, 0x68, 60]));
         assert!(bytes.windows(3).any(|w| w == [0x1D, 0x6B, 73]));
         assert!(bytes.windows(b"ABC-12345".len()).any(|w| w == b"ABC-12345"));
+    }
+
+    #[test]
+    fn test_escpos_barcode_128_length_overflow() {
+        let long_data = "A".repeat(500);
+        let mut b = EscPosBuilder::new();
+        b.barcode_128(&long_data, 60);
+        let bytes = b.into_bytes();
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == [0x1D, 0x6B, 73, 255])
+            .expect("len byte phải là 255 (= 253 + 2)");
+        let emitted = &bytes[pos + 6..];
+        assert_eq!(emitted.len(), 253);
+        assert!(emitted.iter().all(|&b| b == b'A'));
     }
 
     #[test]

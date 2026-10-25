@@ -1,6 +1,15 @@
 use super::EscPosBuilder;
 use serde::{Deserialize, Serialize};
 
+fn write_padded_cell(buf: &mut String, value: &str, width: usize, align: &str) {
+    use std::fmt::Write;
+    let _ = match align {
+        "right" => write!(buf, "{:>width$}", value, width = width),
+        "center" => write!(buf, "{:^width$}", value, width = width),
+        _ => write!(buf, "{:<width$}", value, width = width),
+    };
+}
+
 fn default_divider_style() -> String {
     "dashed".to_string()
 }
@@ -116,11 +125,10 @@ impl PrintDocument {
                 }
 
                 PrintCommand::Table { columns, rows } => {
-                    use std::fmt::Write;
                     builder.align_left().bold(false).font_size(1, 1);
                     let mut line_buf = String::with_capacity(128);
                     for col in columns {
-                        let _ = write!(line_buf, "{:<width$}", col.title, width = col.width);
+                        write_padded_cell(&mut line_buf, &col.title, col.width, &col.align);
                     }
                     builder.text_line(&line_buf);
                     builder.divider("dashed");
@@ -128,8 +136,11 @@ impl PrintDocument {
                     for row in rows {
                         line_buf.clear();
                         for (i, cell) in row.iter().enumerate() {
-                            let width = columns.get(i).map(|c| c.width).unwrap_or(10);
-                            let _ = write!(line_buf, "{:<width$}", cell, width = width);
+                            let (width, align) = columns
+                                .get(i)
+                                .map(|c| (c.width, c.align.as_str()))
+                                .unwrap_or((10, "left"));
+                            write_padded_cell(&mut line_buf, cell, width, align);
                         }
                         builder.text_line(&line_buf);
                     }
@@ -207,5 +218,37 @@ mod tests {
         );
         assert!(bytes.windows(b"Coffee".len()).any(|w| w == b"Coffee"));
         assert!(bytes.windows(b"12345678".len()).any(|w| w == b"12345678"));
+    }
+
+    #[test]
+    fn test_table_column_alignment() {
+        let doc = PrintDocument {
+            title: None,
+            commands: vec![PrintCommand::Table {
+                columns: vec![
+                    TableColumn {
+                        title: "L".to_string(),
+                        width: 4,
+                        align: "left".to_string(),
+                    },
+                    TableColumn {
+                        title: "R".to_string(),
+                        width: 4,
+                        align: "right".to_string(),
+                    },
+                    TableColumn {
+                        title: "C".to_string(),
+                        width: 4,
+                        align: "center".to_string(),
+                    },
+                ],
+                rows: vec![vec!["a".to_string(), "b".to_string(), "c".to_string()]],
+            }],
+        };
+
+        let bytes = doc.compile_escpos();
+        let text = String::from_utf8_lossy(&bytes);
+        let data_line = text.lines().last().unwrap();
+        assert_eq!(data_line, "a      b c  ");
     }
 }

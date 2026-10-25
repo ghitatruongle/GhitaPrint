@@ -8,15 +8,17 @@ use tokio::time::timeout;
 pub struct TcpTransport {
     stream: TcpStream,
     address: String,
+    timeout_secs: u64,
 }
 
 #[allow(dead_code)]
 impl TcpTransport {
     pub fn normalize_address(addr: &str) -> String {
-        if addr.contains(':') {
-            addr.to_string()
+        let bare = addr.strip_prefix("tcp://").unwrap_or(addr);
+        if bare.contains(':') {
+            bare.to_string()
         } else {
-            format!("{}:9100", addr)
+            format!("{}:9100", bare)
         }
     }
 
@@ -34,6 +36,7 @@ impl TcpTransport {
         Ok(Self {
             stream,
             address: full_addr,
+            timeout_secs,
         })
     }
 
@@ -53,11 +56,15 @@ impl TcpTransport {
 
 impl PrinterTransport for TcpTransport {
     async fn send_raw(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        self.stream
-            .write_all(data)
-            .await
-            .map_err(TransportError::Io)?;
-        self.stream.flush().await.map_err(TransportError::Io)?;
+        timeout(Duration::from_secs(self.timeout_secs.max(30)), async {
+            self.stream
+                .write_all(data)
+                .await
+                .map_err(TransportError::Io)?;
+            self.stream.flush().await.map_err(TransportError::Io)
+        })
+        .await
+        .map_err(|_| TransportError::Timeout(self.timeout_secs.max(30)))??;
         Ok(())
     }
 
@@ -83,6 +90,14 @@ mod tests {
         assert_eq!(
             TcpTransport::normalize_address("localhost:9105"),
             "localhost:9105"
+        );
+        assert_eq!(
+            TcpTransport::normalize_address("tcp://192.168.1.100:9100"),
+            "192.168.1.100:9100"
+        );
+        assert_eq!(
+            TcpTransport::normalize_address("tcp://192.168.1.100"),
+            "192.168.1.100:9100"
         );
     }
 

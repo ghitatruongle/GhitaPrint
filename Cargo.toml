@@ -1,6 +1,6 @@
 [package]
 name = "ghitaprint"
-version = "0.0.0-preview"
+version = "0.0.0"
 edition = "2024"
 
 [dependencies]
