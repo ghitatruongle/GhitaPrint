@@ -1,6 +1,6 @@
 # 📋 AGENT GUIDELINES & PROJECT RULES
 
-> **Phiên bản hiện tại của dự án:** `0.0.0`
+> **Phiên bản hiện tại của dự án:** `0.0.1-preview`
 
 Tài liệu này định nghĩa các nguyên tắc phát triển và quy định bắt buộc đối với AI Agent và lập trình viên khi làm việc trong dự án **GhitaPrint**:
 
@@ -25,7 +25,7 @@ Tài liệu này định nghĩa các nguyên tắc phát triển và quy định
 ### 3. Quy chuẩn đặt tên file Setup phát hành trong thư mục `release/`
 * Mọi file bộ cài đặt phát hành nằm trong thư mục `d:\GhitaPrint\release` bắt buộc phải tuân theo định dạng:
   `GhitaPrint_x.x.x(-beta/-alpha/...).exe`
-* **Ví dụ tương ứng phiên bản hiện tại:** `GhitaPrint_0.0.0.exe`
+* **Ví dụ tương ứng phiên bản hiện tại:** `GhitaPrint_0.0.1-preview.exe`
 * Thư mục `release/` chỉ chứa duy nhất một file cài đặt này cho phiên bản phát hành hiện tại.
 * File bộ cài không được đưa vào mã nguồn git (`/release` nằm trong `.gitignore`); mỗi bản phát hành đăng kèm **SHA-256** tại trang **GitHub Releases**.
 

@@ -23,7 +23,7 @@ pub fn install_virtual_printer(port: u16) -> Result<String, String> {
                 PRINTER_NAME, port_url
             ))
         } else {
-            Ok(format!("Lệnh đã gửi tới Windows Spooler: {}", res))
+            Err(format!("Windows Spooler từ chối lệnh cài đặt: {}", res))
         }
     }
 
@@ -50,7 +50,7 @@ pub fn uninstall_virtual_printer() -> Result<String, String> {
         if res.contains("OK") {
             Ok(format!("Đã gỡ bỏ máy in ảo '{}'", PRINTER_NAME))
         } else {
-            Ok(format!("Kết quả: {}", res))
+            Err(format!("Windows Spooler từ chối lệnh gỡ bỏ: {}", res))
         }
     }
 

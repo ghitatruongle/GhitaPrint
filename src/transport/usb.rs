@@ -142,7 +142,17 @@ impl UsbTransport {
             ))
         })?;
 
-        let out_endpoint = 0x01;
+        let out_endpoint = interface
+            .descriptors()
+            .find_map(|alt| {
+                alt.endpoints()
+                    .find(|ep| {
+                        ep.direction() == nusb::transfer::Direction::Out
+                            && ep.transfer_type() == nusb::transfer::EndpointType::Bulk
+                    })
+                    .map(|ep| ep.address())
+            })
+            .unwrap_or(0x01);
 
         Ok(Self {
             interface,

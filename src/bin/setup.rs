@@ -7,6 +7,8 @@ use std::process::Command;
 #[cfg(windows)]
 use winreg::RegKey;
 #[cfg(windows)]
+use winreg::RegValue;
+#[cfg(windows)]
 use winreg::enums::*;
 
 const EMBEDDED_GHITAPRINT_EXE: &[u8] = include_bytes!("../../target/release/ghitaprint.exe");
@@ -58,6 +60,18 @@ fn stop_running_instances() {
 }
 
 #[cfg(windows)]
+fn reg_expand_sz(value: &str) -> RegValue {
+    RegValue {
+        bytes: value
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+        vtype: REG_EXPAND_SZ,
+    }
+}
+
+#[cfg(windows)]
 fn add_to_user_path(dir: &Path) -> io::Result<bool> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (env_key, _) = hkcu.create_subkey("Environment")?;
@@ -76,7 +90,7 @@ fn add_to_user_path(dir: &Path) -> io::Result<bool> {
         format!("{};{}", current_path.trim_end_matches(';'), dir_str)
     };
 
-    env_key.set_value("Path", &new_path)?;
+    env_key.set_raw_value("Path", &reg_expand_sz(&new_path))?;
 
     let _ = Command::new("powershell")
         .args([
@@ -100,7 +114,7 @@ fn remove_from_user_path(dir: &Path) -> io::Result<bool> {
             .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&dir_str))
             .collect();
         let new_path = paths.join(";");
-        env_key.set_value("Path", &new_path)?;
+        env_key.set_raw_value("Path", &reg_expand_sz(&new_path))?;
         return Ok(true);
     }
     Ok(false)

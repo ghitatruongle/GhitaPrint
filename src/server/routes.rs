@@ -107,8 +107,14 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRespon
     })
 }
 
-async fn printers_handler() -> Json<Vec<PrinterInfo>> {
-    let printers = DeviceScanner::scan_usb();
+async fn printers_handler(State(state): State<Arc<AppState>>) -> Json<Vec<PrinterInfo>> {
+    let mut printers = DeviceScanner::scan_usb();
+    let mut candidates: Vec<String> = vec!["127.0.0.1:9100".to_string()];
+    if !state.default_printer.is_empty() && !state.default_printer.starts_with("usb://") {
+        candidates.push(state.default_printer.clone());
+    }
+    let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    printers.extend(DeviceScanner::scan_network(&refs).await);
     Json(printers)
 }
 

@@ -69,7 +69,15 @@ impl ConfigManager {
         }
         let toml_str =
             toml::to_string_pretty(settings).map_err(|e| std::io::Error::other(e.to_string()))?;
-        fs::write(&self.path, toml_str)
+        let tmp_path = self.path.with_extension("toml.tmp");
+        fs::write(&tmp_path, toml_str)?;
+        match fs::rename(&tmp_path, &self.path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
     }
 
     pub fn get_path(&self) -> &Path {

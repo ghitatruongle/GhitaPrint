@@ -69,8 +69,7 @@ impl EscPosBuilder {
 
     pub fn divider(&mut self, style: &str) -> &mut Self {
         let line = match style {
-            "solid" => "════════════════════════════════\n",
-            "double" => "================================\n",
+            "solid" | "double" => "================================\n",
             _ => "--------------------------------\n",
         };
         self.text(line)

@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "ghitaprint"
-version = "0.0.0"
+version = "0.0.1-preview"
 dependencies = [
  "axum",
  "clap",

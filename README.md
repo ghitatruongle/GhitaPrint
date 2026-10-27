@@ -87,11 +87,11 @@ Kết quả: **21 passed, 0 failed, 0 warnings**.
 
 ---
 
-## 📦 5. Bộ Cài Đặt 1-Click Duy Nhất (`GhitaPrint_0.0.0.exe`)
+## 📦 5. Bộ Cài Đặt 1-Click Duy Nhất (`GhitaPrint_0.0.1-preview.exe`)
 
 Bản phát hành kèm duy nhất bộ cài độc lập:
 
-* **Bản phát hành:** `GhitaPrint_0.0.0.exe` (~2.2 MB) — tải từ [GitHub Releases](https://github.com/ghitatruongle/GhitaPrint/releases) (bộ cài không nằm trong mã nguồn git)
+* **Bản phát hành:** `GhitaPrint_0.0.1-preview.exe` (~2.2 MB) — tải từ [GitHub Releases](https://github.com/ghitatruongle/GhitaPrint/releases) (bộ cài không nằm trong mã nguồn git)
 * **Tự động hóa hoàn toàn:**
   1. Trích xuất file thực thi `ghitaprint.exe` vào `%LocalAppData%\Programs\GhitaPrint`.
   2. Tự động thêm vào biến môi trường **PATH** để gõ lệnh `ghitaprint` ở mọi terminal.
@@ -101,19 +101,19 @@ Bản phát hành kèm duy nhất bộ cài độc lập:
 
 ```bash
 # Cài đặt thông thường (hiện giao diện CLI đẹp mắt)
-.\GhitaPrint_0.0.0.exe
+.\GhitaPrint_0.0.1-preview.exe
 
 # Cài đặt ẩn tự động (Silent / Unattended mode)
-.\GhitaPrint_0.0.0.exe --silent
+.\GhitaPrint_0.0.1-preview.exe --silent
 
 # Gỡ cài đặt sạch sẽ khỏi máy tính
-.\GhitaPrint_0.0.0.exe --uninstall
+.\GhitaPrint_0.0.1-preview.exe --uninstall
 ```
 
 ### Cách build lại bộ cài đặt:
 ```bash
 cargo build --release --bin ghitaprint
 cargo build --release --bin setup
-Copy-Item target\release\setup.exe release\GhitaPrint_0.0.0.exe -Force
+Copy-Item target\release\setup.exe release\GhitaPrint_0.0.1-preview.exe -Force
 ```
 

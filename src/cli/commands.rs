@@ -81,7 +81,7 @@ pub struct ScanArgs {
     #[arg(long, help = "Liệt kê toàn bộ thiết bị USB cắm trên máy để chẩn đoán")]
     pub all: bool,
 
-    #[arg(long, help = "Chỉ quét máy in qua mạng LAN (mDNS & TCP 9100)")]
+    #[arg(long, help = "Chỉ quét máy in qua mạng (TCP cổng 9100)")]
     pub network: bool,
 
     #[arg(long, help = "Chỉ quét máy in Bluetooth")]
@@ -95,14 +95,6 @@ pub struct TestArgs {
 
     #[arg(long, help = "In tem mã vạch mẫu test (TSPL / ZPL)")]
     pub label: bool,
-
-    #[arg(
-        short,
-        long,
-        default_value = "network",
-        help = "Loại kết nối mục tiêu (network, usb, bluetooth)"
-    )]
-    pub target: String,
 
     #[arg(
         short,
@@ -194,8 +186,7 @@ pub struct DaemonArgs {
     #[arg(
         short,
         long,
-        default_value_t = 9123,
-        help = "Cổng lắng nghe của Local REST & WebSocket API (mặc định 9123)"
+        help = "Cổng lắng nghe của Local REST & WebSocket API (mặc định theo api_port trong cấu hình)"
     )]
-    pub port: u16,
+    pub port: Option<u16>,
 }

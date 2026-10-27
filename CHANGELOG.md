@@ -5,6 +5,39 @@ Toàn bộ thay đổi đáng chú ý của **GhitaPrint** được ghi nhận t
 
 ---
 
+## [0.0.1-preview] — 2026-10-28
+
+### 🔍 Bản preview sau đợt review & debug toàn bộ mã nguồn
+
+Bản phát hành preview đầu tiên của chu kỳ `0.0.1`, đánh dấu phiên bản làm việc mới sau bản phát hành chính thức `0.0.0`. Toàn bộ mã nguồn (15 tệp, ~3.400 dòng) đã được review và debug; 24 automated tests và Clippy chạy sạch hoàn toàn.
+
+#### 🛠️ Sửa lỗi đầu ra máy in
+- Bảng trong JSON Document: ô dài hơn chiều rộng cột trước đây làm trôi lệch toàn bộ layout phía sau — giờ tự cắt đúng độ rộng cột; ô thừa ngoài số cột khai báo được bỏ qua thay vì in với width mặc định 10.
+- TSPL: chuỗi chứa dấu nháy kép được escape dạng `\"` không đúng chuẩn TSPL (máy in phát ra ký tự rác) — giờ thay `"` bằng `'` trong tham số có nháy.
+- ESC/POS `divider` style "solid" dùng ký tự Unicode `═` (3 byte UTF-8 mỗi ký tự) khiến máy in nhiệt phát ~96 ký tự rác — đổi về ASCII chuẩn.
+- USB Direct Engine: endpoint Bulk OUT trước đây hardcode `0x01` với nhiều máy in không in được — giờ tự dò địa chỉ endpoint từ USB descriptor, fallback `0x01`.
+
+#### 🛠️ Sửa báo cáo trạng thái sai lệch
+- `daemon --stop` trước đây chỉ in thông báo thành công giả — giờ thật sự kết thúc tiến trình daemon (`taskkill` loại trừ PID của chính lệnh gọi).
+- `daemon --restart` trước đây không làm gì — giờ dừng daemon cũ rồi khởi chạy lại.
+- `status` hiển thị hardcode "Sẵn sàng" — giờ health-check thật cổng API, báo "Đang chạy / Không chạy".
+- Cài/gỡ máy in ảo thất bại trước đây bị trả về dạng thành công — giờ trả lỗi kèm thông báo từ Windows Spooler.
+- `scan --bluetooth` âm thầm trả về danh sách rỗng — giờ cảnh báo tính năng chưa hỗ trợ; flag `--target` chết của lệnh `test` bị loại bỏ; help `scan --network` bỏ nhắc "mDNS" chưa triển khai.
+
+#### 🛠️ Sửa độ bền hệ thống
+- `daemon --start` trước đây mặc định hardcode cổng 9123 bỏ qua `api_port` trong cấu hình — giờ ưu tiên `api_port` khi không truyền `--port`.
+- `GET /api/v1/printers` trước đây chỉ quét USB — giờ quét thêm mạng (localhost:9100 + máy in mặc định cấu hình).
+- Bộ cài setup.exe ghi PATH registry bằng REG_SZ phá khả năng mở rộng `%VAR%` của PATH người dùng — giờ ghi đúng REG_EXPAND_SZ.
+- Lưu cấu hình `ghitaprint.toml` trước đây ghi trực tiếp (crash giữa chừng làm hỏng file) — giờ ghi atomic qua file tạm rồi rename.
+
+#### 📦 Tải xuống
+- Bộ cài 1-Click: `GhitaPrint_0.0.1-preview.exe` (~2.45 MB) — cài thường / `--silent` / `--uninstall`, tự thêm PATH, đăng ký tự khởi động, cài máy in ảo và chạy daemon.
+- SHA-256: `4c3bb59aeeee9c557292a10cdb5f83c30b64848c5c0f27a5bea085f03f49fea9`
+
+#### ✅ Chất lượng
+- 24 automated tests: 24 passed, 0 failed, 0 warnings; Clippy: 0 warning toàn bộ target.
+- File bộ cài không track trong mã nguồn git (`/release` trong `.gitignore`).
+
 ## [0.0.0] — 2026-10-11
 
 ### 🎉 Phát hành chính thức đầu tiên

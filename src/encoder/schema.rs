@@ -3,10 +3,15 @@ use serde::{Deserialize, Serialize};
 
 fn write_padded_cell(buf: &mut String, value: &str, width: usize, align: &str) {
     use std::fmt::Write;
+    let truncated: String = if value.chars().count() > width {
+        value.chars().take(width).collect()
+    } else {
+        value.to_string()
+    };
     let _ = match align {
-        "right" => write!(buf, "{:>width$}", value, width = width),
-        "center" => write!(buf, "{:^width$}", value, width = width),
-        _ => write!(buf, "{:<width$}", value, width = width),
+        "right" => write!(buf, "{:>width$}", truncated, width = width),
+        "center" => write!(buf, "{:^width$}", truncated, width = width),
+        _ => write!(buf, "{:<width$}", truncated, width = width),
     };
 }
 
@@ -135,12 +140,9 @@ impl PrintDocument {
 
                     for row in rows {
                         line_buf.clear();
-                        for (i, cell) in row.iter().enumerate() {
-                            let (width, align) = columns
-                                .get(i)
-                                .map(|c| (c.width, c.align.as_str()))
-                                .unwrap_or((10, "left"));
-                            write_padded_cell(&mut line_buf, cell, width, align);
+                        for (i, cell) in row.iter().enumerate().take(columns.len()) {
+                            let col = &columns[i];
+                            write_padded_cell(&mut line_buf, cell, col.width, &col.align);
                         }
                         builder.text_line(&line_buf);
                     }
@@ -218,6 +220,37 @@ mod tests {
         );
         assert!(bytes.windows(b"Coffee".len()).any(|w| w == b"Coffee"));
         assert!(bytes.windows(b"12345678".len()).any(|w| w == b"12345678"));
+    }
+
+    #[test]
+    fn test_table_cell_overflow_truncated() {
+        let doc = PrintDocument {
+            title: None,
+            commands: vec![PrintCommand::Table {
+                columns: vec![
+                    TableColumn {
+                        title: "Item".to_string(),
+                        width: 6,
+                        align: "left".to_string(),
+                    },
+                    TableColumn {
+                        title: "Price".to_string(),
+                        width: 5,
+                        align: "right".to_string(),
+                    },
+                ],
+                rows: vec![vec![
+                    "Caramel-Macchiato-Venti".to_string(),
+                    "35k".to_string(),
+                ]],
+            }],
+        };
+
+        let bytes = doc.compile_escpos();
+        let text = String::from_utf8_lossy(&bytes);
+        let data_line = text.lines().last().unwrap();
+        assert_eq!(data_line, "Carame  35k");
+        assert_eq!(data_line.chars().count(), 11);
     }
 
     #[test]

@@ -6,16 +6,8 @@ pub struct TsplBuilder {
 
 #[inline]
 fn write_escaped_tspl_str(buf: &mut Vec<u8>, s: &str) {
-    if !s.contains('"') {
-        buf.extend_from_slice(s.as_bytes());
-    } else {
-        for &b in s.as_bytes() {
-            if b == b'"' {
-                buf.extend_from_slice(b"\\\"");
-            } else {
-                buf.push(b);
-            }
-        }
+    for b in s.replace('"', "'").as_bytes() {
+        buf.push(*b);
     }
 }
 
@@ -168,6 +160,6 @@ mod tests {
         b.text(10, 10, "3", 1, 1, "Product \"Special\"");
         let bytes = b.into_bytes();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("Product \\\"Special\\\""));
+        assert!(s.contains("Product 'Special'"));
     }
 }

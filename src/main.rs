@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cli;
@@ -57,6 +58,9 @@ async fn main() {
                     }
                 }
             } else {
+                if scan_args.bluetooth {
+                    print_warning("Quét Bluetooth hiện chưa được hỗ trợ trong phiên bản này.");
+                }
                 if scan_args.usb || (!scan_args.network && !scan_args.bluetooth) {
                     let usb_printers = DeviceScanner::scan_usb();
                     detected_printers.extend(usb_printers);
@@ -363,27 +367,28 @@ async fn main() {
         },
 
         Commands::Daemon(daemon_args) => {
+            let daemon_port = daemon_args.port.unwrap_or(settings.api_port);
             if daemon_args.start {
                 print_info(&format!(
                     "Đang khởi chạy GhitaPrint Daemon trên cổng {}...",
-                    daemon_args.port
+                    daemon_port
                 ));
                 print_success(&format!(
                     "GhitaPrint Local API đã sẵn sàng tại: http://127.0.0.1:{}",
-                    daemon_args.port
+                    daemon_port
                 ));
                 println!(
                     "  • REST API   : http://127.0.0.1:{}/api/v1/print",
-                    daemon_args.port
+                    daemon_port
                 );
                 println!(
                     "  • WebSocket  : ws://127.0.0.1:{}/api/v1/ws",
-                    daemon_args.port
+                    daemon_port
                 );
                 println!("  • Nhấn Ctrl + C để dừng dịch vụ.");
 
                 if let Err(e) = server::start_server(
-                    daemon_args.port,
+                    daemon_port,
                     settings.default_printer.clone(),
                     settings.connection_timeout_secs,
                 )
@@ -392,11 +397,28 @@ async fn main() {
                     print_error(&format!("Lỗi máy chủ: {}", e));
                 }
             } else if daemon_args.stop {
-                print_info("Đang gửi tín hiệu dừng tới GhitaPrint Daemon...");
-                print_success("Đã hoàn tất kiểm tra trạng thái.");
+                print_info("Đang dừng GhitaPrint Daemon...");
+                if stop_running_daemon() {
+                    print_success("Đã dừng GhitaPrint Daemon.");
+                } else {
+                    print_info("Không có tiến trình daemon nào đang chạy.");
+                }
             } else if daemon_args.restart {
                 print_info("Đang khởi động lại GhitaPrint Daemon...");
-                print_success("Daemon đã khởi động lại.");
+                stop_running_daemon();
+                print_success(&format!(
+                    "GhitaPrint Local API đã sẵn sàng tại: http://127.0.0.1:{}",
+                    daemon_port
+                ));
+                if let Err(e) = server::start_server(
+                    daemon_port,
+                    settings.default_printer.clone(),
+                    settings.connection_timeout_secs,
+                )
+                .await
+                {
+                    print_error(&format!("Lỗi máy chủ: {}", e));
+                }
             } else {
                 print_info("Sử dụng: ghitaprint daemon --start | --stop | --restart");
             }
@@ -404,8 +426,20 @@ async fn main() {
 
         Commands::Status => {
             let is_startup = os::is_startup_enabled();
+            let daemon_alive = TcpTransport::check_alive(
+                &format!("127.0.0.1:{}", settings.api_port),
+                1,
+            )
+            .await;
             print_info("Trạng thái GhitaPrint Engine:");
-            println!("  • Tiến trình Daemon   : Sẵn sàng");
+            println!(
+                "  • Tiến trình Daemon   : {}",
+                if daemon_alive {
+                    "Đang chạy [✔]"
+                } else {
+                    "Không chạy"
+                }
+            );
             println!(
                 "  • Tự khởi động Windows: {}",
                 if is_startup {
@@ -428,6 +462,25 @@ async fn main() {
             );
         }
     }
+}
+
+#[cfg(windows)]
+fn stop_running_daemon() -> bool {
+    let output = Command::new("taskkill")
+        .args([
+            "/IM",
+            "ghitaprint.exe",
+            "/F",
+            "/FI",
+            &format!("PID ne {}", std::process::id()),
+        ])
+        .output();
+    matches!(output, Ok(out) if out.status.success())
+}
+
+#[cfg(not(windows))]
+fn stop_running_daemon() -> bool {
+    false
 }
 
 async fn send_to_printer(target_addr: &str, data: &[u8], timeout_secs: u64) {
