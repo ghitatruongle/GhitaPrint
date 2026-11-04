@@ -9,8 +9,8 @@
 
 1. **Không cần cài driver hãng:** Kết nối trực tiếp máy in USB (qua Bulk OUT Endpoint với `nusb`), máy in mạng (TCP 9100 JetDirect) và máy in ảo Windows (Microsoft IPP Class Driver) mà không cần cài driver từ đĩa/hãng (Xprinter, Epson, Zebra, Brother, Canon...).
 2. **Siêu nhẹ & Tốc độ cao:** 
-   * Viết bằng Rust thuần, Single Binary **chỉ 1.89 MB** (nhỏ gấp 50 lần so với Java/Electron).
-   * Tiêu thụ chỉ **5–8 MB RAM** khi chạy nền.
+   * Viết bằng Rust thuần, Single Binary **chỉ 1.97 MB** (nhỏ gấp 50 lần so với Java/Electron).
+   * Tiêu thụ chỉ **~12 MB RAM** khi chạy nền (đo thực tế).
    * Khởi động tức thì trong **0.05 giây**.
 3. **100% Điều khiển qua CLI (CLI-First):** Quét cổng, cấu hình, in thử nghiệm, bật tự khởi động cùng Windows, và quản lý máy in ảo hoàn toàn bằng dòng lệnh terminal.
 
@@ -38,9 +38,10 @@ ghitaprint print --raw "ESC @..." # Gửi chuỗi byte thô ra máy in
 ghitaprint config list          # Xem cấu hình hiện tại (tại %APPDATA%\GhitaPrint\ghitaprint.toml)
 ghitaprint config set default_printer "usb://0416:5011" # Đặt máy in mặc định
 ghitaprint config set api_port 9123 # Đổi cổng Local REST & WebSocket API
+ghitaprint config set api_token "<secret>" # Bật bảo vệ Local API (Bearer token, tùy chọn)
 
 # 5. Tự khởi động cùng Windows (Startup)
-ghitaprint startup install      # Tự động đăng ký ghitaprint.exe chạy ngầm khi Windows bật máy
+ghitaprint startup install      # Tự động đăng ký ghitaprint.exe chạy nền ẩn khi Windows bật máy (không cửa sổ console)
 ghitaprint startup status       # Kiểm tra trạng thái đăng ký Registry Run
 ghitaprint startup uninstall    # Gỡ bỏ tự khởi động
 
@@ -77,21 +78,21 @@ ghitaprint daemon --start --port 9123
 
 ## 🧪 4. Kiểm thử tự động (Unit Tests)
 
-Dự án bao gồm bộ 21 automated tests kiểm tra toàn bộ luồng truyền nhận, mã hóa và máy chủ API:
+Dự án bao gồm bộ 36 automated tests kiểm tra toàn bộ luồng truyền nhận, mã hóa và máy chủ API:
 
 ```bash
 cargo test
 ```
 
-Kết quả: **21 passed, 0 failed, 0 warnings**.
+Kết quả: **36 passed, 0 failed, 0 warnings**.
 
 ---
 
-## 📦 5. Bộ Cài Đặt 1-Click Duy Nhất (`GhitaPrint_0.0.1-preview.exe`)
+## 📦 5. Bộ Cài Đặt 1-Click Duy Nhất (`GhitaPrint_0.0.1.exe`)
 
 Bản phát hành kèm duy nhất bộ cài độc lập:
 
-* **Bản phát hành:** `GhitaPrint_0.0.1-preview.exe` (~2.2 MB) — tải từ [GitHub Releases](https://github.com/ghitatruongle/GhitaPrint/releases) (bộ cài không nằm trong mã nguồn git)
+* **Bản phát hành:** `GhitaPrint_0.0.1.exe` (~2.2 MB) — tải từ [GitHub Releases](https://github.com/ghitatruongle/GhitaPrint/releases) (bộ cài không nằm trong mã nguồn git)
 * **Tự động hóa hoàn toàn:**
   1. Trích xuất file thực thi `ghitaprint.exe` vào `%LocalAppData%\Programs\GhitaPrint`.
   2. Tự động thêm vào biến môi trường **PATH** để gõ lệnh `ghitaprint` ở mọi terminal.
@@ -101,19 +102,19 @@ Bản phát hành kèm duy nhất bộ cài độc lập:
 
 ```bash
 # Cài đặt thông thường (hiện giao diện CLI đẹp mắt)
-.\GhitaPrint_0.0.1-preview.exe
+.\GhitaPrint_0.0.1.exe
 
 # Cài đặt ẩn tự động (Silent / Unattended mode)
-.\GhitaPrint_0.0.1-preview.exe --silent
+.\GhitaPrint_0.0.1.exe --silent
 
 # Gỡ cài đặt sạch sẽ khỏi máy tính
-.\GhitaPrint_0.0.1-preview.exe --uninstall
+.\GhitaPrint_0.0.1.exe --uninstall
 ```
 
 ### Cách build lại bộ cài đặt:
 ```bash
 cargo build --release --bin ghitaprint
 cargo build --release --bin setup
-Copy-Item target\release\setup.exe release\GhitaPrint_0.0.1-preview.exe -Force
+Copy-Item target\release\setup.exe release\GhitaPrint_0.0.1.exe -Force
 ```
 

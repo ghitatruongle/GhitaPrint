@@ -154,10 +154,11 @@ async fn main() {
                             "Đang xử lý ảnh {} qua thuật toán Floyd-Steinberg...",
                             img_path.display()
                         ));
+                        let target_width = print_args.image_width.map(|w| w.clamp(1, 2048));
                         let mut raster_bytes = vec![0x1B, 0x40];
                         raster_bytes.extend(FloydSteinbergRasterizer::to_escpos_raster(
                             &img,
-                            print_args.image_width,
+                            target_width,
                         ));
                         raster_bytes.extend_from_slice(&[0x1B, 0x64, 0x03]);
                         raster_bytes
@@ -215,7 +216,26 @@ async fn main() {
         Commands::Config(config_args) => match config_args.action {
             ConfigAction::List => {
                 if args.json {
-                    cli::output::render_json(&settings);
+                    match serde_json::to_value(&settings) {
+                        Ok(mut value) => {
+                            if let Some(obj) = value.as_object_mut() {
+                                let masked = if settings.api_token.is_empty() {
+                                    String::new()
+                                } else {
+                                    "••••••••".to_string()
+                                };
+                                obj.insert(
+                                    "api_token".to_string(),
+                                    serde_json::Value::String(masked),
+                                );
+                            }
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&value).unwrap_or_default()
+                            );
+                        }
+                        Err(e) => print_error(&format!("Lỗi serialize JSON: {}", e)),
+                    }
                 } else {
                     print_info(&format!(
                         "Tệp cấu hình: {}",
@@ -232,6 +252,14 @@ async fn main() {
                         "  • connection_timeout_secs = {}",
                         settings.connection_timeout_secs
                     );
+                    println!(
+                        "  • api_token               = \"{}\"",
+                        if settings.api_token.is_empty() {
+                            ""
+                        } else {
+                            "••••••••"
+                        }
+                    );
                 }
             }
             ConfigAction::Get { key } => match key.as_str() {
@@ -240,6 +268,7 @@ async fn main() {
                 "auto_startup" => println!("{}", settings.auto_startup),
                 "log_level" => println!("{}", settings.log_level),
                 "connection_timeout_secs" => println!("{}", settings.connection_timeout_secs),
+                "api_token" => println!("{}", settings.api_token),
                 _ => print_error(&format!("Không tìm thấy khóa cấu hình '{}'", key)),
             },
             ConfigAction::Set { key, value } => {
@@ -272,6 +301,7 @@ async fn main() {
                             updated = false;
                         }
                     }
+                    "api_token" => new_settings.api_token = value.clone(),
                     _ => {
                         print_error(&format!("Không hỗ trợ khóa cấu hình '{}'", key));
                         updated = false;
@@ -295,21 +325,14 @@ async fn main() {
         },
 
         Commands::Startup(startup_args) => match startup_args.action {
-            StartupAction::Install { service } => {
-                if service {
-                    print_info("Đang đăng ký GhitaPrint dưới dạng Windows Service...");
-                    print_warning(
-                        "Chế độ Windows Service đang được tối ưu hóa cho bản phát hành chính thức.",
-                    );
-                } else {
-                    print_info("Đang đăng ký GhitaPrint vào Windows Registry Run (HKCU)...");
-                    match os::install_startup() {
-                        Ok(cmd) => {
-                            print_success("Đã kích hoạt tự khởi động cùng Windows thành công!");
-                            println!("  Lệnh đăng ký: {}", cmd);
-                        }
-                        Err(e) => print_error(&format!("Lỗi khi đăng ký khởi động: {}", e)),
+            StartupAction::Install => {
+                print_info("Đang đăng ký GhitaPrint vào Windows Registry Run (HKCU)...");
+                match os::install_startup() {
+                    Ok(cmd) => {
+                        print_success("Đã kích hoạt tự khởi động ẩn cùng Windows thành công!");
+                        println!("  Lệnh đăng ký: {}", cmd);
                     }
+                    Err(e) => print_error(&format!("Lỗi khi đăng ký khởi động: {}", e)),
                 }
             }
             StartupAction::Uninstall => {
@@ -368,6 +391,16 @@ async fn main() {
 
         Commands::Daemon(daemon_args) => {
             let daemon_port = daemon_args.port.unwrap_or(settings.api_port);
+
+            if daemon_args.start && daemon_args.hidden {
+                if spawn_hidden_daemon(daemon_args.port) {
+                    print_success("Daemon nền đã được khởi chạy ẩn (không cửa sổ console).");
+                } else {
+                    print_error("Không thể khởi chạy daemon nền ẩn.");
+                }
+                return;
+            }
+
             if daemon_args.start {
                 print_info(&format!(
                     "Đang khởi chạy GhitaPrint Daemon trên cổng {}...",
@@ -381,16 +414,14 @@ async fn main() {
                     "  • REST API   : http://127.0.0.1:{}/api/v1/print",
                     daemon_port
                 );
-                println!(
-                    "  • WebSocket  : ws://127.0.0.1:{}/api/v1/ws",
-                    daemon_port
-                );
+                println!("  • WebSocket  : ws://127.0.0.1:{}/api/v1/ws", daemon_port);
                 println!("  • Nhấn Ctrl + C để dừng dịch vụ.");
 
                 if let Err(e) = server::start_server(
                     daemon_port,
                     settings.default_printer.clone(),
                     settings.connection_timeout_secs,
+                    settings.api_token.clone(),
                 )
                 .await
                 {
@@ -414,6 +445,7 @@ async fn main() {
                     daemon_port,
                     settings.default_printer.clone(),
                     settings.connection_timeout_secs,
+                    settings.api_token.clone(),
                 )
                 .await
                 {
@@ -426,11 +458,8 @@ async fn main() {
 
         Commands::Status => {
             let is_startup = os::is_startup_enabled();
-            let daemon_alive = TcpTransport::check_alive(
-                &format!("127.0.0.1:{}", settings.api_port),
-                1,
-            )
-            .await;
+            let daemon_alive =
+                TcpTransport::check_alive(&format!("127.0.0.1:{}", settings.api_port), 1).await;
             print_info("Trạng thái GhitaPrint Engine:");
             println!(
                 "  • Tiến trình Daemon   : {}",
@@ -462,6 +491,38 @@ async fn main() {
             );
         }
     }
+}
+
+#[cfg(windows)]
+fn spawn_hidden_daemon(port: Option<u16>) -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    let exe_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+
+    let mut command = Command::new(exe_path);
+    command.args(["daemon", "--start"]);
+    if let Some(p) = port {
+        command.arg("--port").arg(p.to_string());
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+
+    command.spawn().is_ok()
+}
+
+#[cfg(not(windows))]
+fn spawn_hidden_daemon(_port: Option<u16>) -> bool {
+    false
 }
 
 #[cfg(windows)]

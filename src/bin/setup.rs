@@ -122,7 +122,7 @@ fn remove_from_user_path(dir: &Path) -> io::Result<bool> {
 
 #[cfg(windows)]
 fn install_registry_run(exe_path: &Path) -> io::Result<()> {
-    let cmd = format!("\"{}\" daemon --start", exe_path.display());
+    let cmd = format!("\"{}\" daemon --start --hidden", exe_path.display());
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _) = hkcu.create_subkey(REG_RUN_PATH)?;
     key.set_value(APP_NAME, &cmd)?;
@@ -164,8 +164,59 @@ fn unregister_virtual_printer() {
         .output();
 }
 
+fn parse_configured_port(content: &str) -> Option<u16> {
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "api_port" {
+            continue;
+        }
+        if let Ok(port) = value.trim().parse::<u16>() {
+            if port > 0 {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+fn read_configured_port() -> u16 {
+    let config_path = match std::env::var("APPDATA") {
+        Ok(app_data) => PathBuf::from(app_data)
+            .join("GhitaPrint")
+            .join("ghitaprint.toml"),
+        Err(_) => return DEFAULT_PORT,
+    };
+
+    match fs::read_to_string(&config_path) {
+        Ok(content) => parse_configured_port(&content).unwrap_or(DEFAULT_PORT),
+        Err(_) => DEFAULT_PORT,
+    }
+}
+
 fn start_daemon_detached(exe_path: &Path) {
-    let _ = Command::new(exe_path).args(["daemon", "--start"]).spawn();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+        let _ = Command::new(exe_path)
+            .args(["daemon", "--start"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+            .spawn();
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new(exe_path).args(["daemon", "--start"]).spawn();
+    }
 }
 
 fn run_install(silent: bool) {
@@ -257,10 +308,12 @@ fn run_install(silent: bool) {
         }
     }
 
+    let configured_port = read_configured_port();
+
     if !silent {
         print!("  5. Cài đặt Máy in ảo Windows 'GhitaPrint' (Microsoft IPP)... ");
     }
-    if register_virtual_printer(DEFAULT_PORT) {
+    if register_virtual_printer(configured_port) {
         if !silent {
             println!("{}", "[OK]".bright_green());
         }
@@ -286,7 +339,10 @@ fn run_install(silent: bool) {
             "  • GhitaPrint đã sẵn sàng hoạt động tại: {}",
             exe_dest.display()
         );
-        println!("  • Cổng Local API   : http://127.0.0.1:9123");
+        println!(
+            "  • Cổng Local API   : http://127.0.0.1:{}",
+            configured_port
+        );
         println!("  • Máy in ảo        : GhitaPrint (In từ Word, Excel, Chrome)");
         println!("  • Sử dụng CLI      : Mở Terminal và gõ: ghitaprint --help");
         println!("  • Gỡ cài đặt       : Chạy lệnh setup --uninstall");
@@ -358,5 +414,40 @@ fn main() {
         run_uninstall(is_silent);
     } else {
         run_install(is_silent);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_configured_port_valid() {
+        let content = "api_port = 9455\ndefault_printer = \"usb://0416:5011\"\n";
+        assert_eq!(parse_configured_port(content), Some(9455));
+    }
+
+    #[test]
+    fn test_parse_configured_port_with_spaces() {
+        let content = "  api_port   =   9999  \n";
+        assert_eq!(parse_configured_port(content), Some(9999));
+    }
+
+    #[test]
+    fn test_parse_configured_port_ignores_similar_keys() {
+        let content = "api_port_backup = 5\napi_portlog = 7\nxapi_port = 8\n";
+        assert_eq!(parse_configured_port(content), None);
+    }
+
+    #[test]
+    fn test_parse_configured_port_ignores_comments_and_invalid() {
+        let content = "# api_port = 9123\napi_port = \"abc\"\napi_port = -5\napi_port = 0\n";
+        assert_eq!(parse_configured_port(content), None);
+    }
+
+    #[test]
+    fn test_parse_configured_port_first_valid_wins() {
+        let content = "api_port = 8080\napi_port = 9123\n";
+        assert_eq!(parse_configured_port(content), Some(8080));
     }
 }

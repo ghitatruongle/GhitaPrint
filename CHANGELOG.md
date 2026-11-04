@@ -5,6 +5,53 @@ Toàn bộ thay đổi đáng chú ý của **GhitaPrint** được ghi nhận t
 
 ---
 
+## [0.0.1] — 2026-11-05
+
+### 🎉 Phát hành chính thức chu kỳ 0.0.1
+
+Kết thúc chu kỳ `0.0.1` sau bản preview: các lỗi lớp cài đặt và daemon lifecycle phát hiện qua đợt phân tích sâu
+toàn bộ mã nguồn đã được sửa, cộng thêm bảo mật API và WebSocket nhận job in thực tế.
+
+#### 🛠️ Sửa lỗi bộ cài & daemon lifecycle
+- Bộ cài setup.exe trước đây khởi chạy daemon kế thừa console của trình cài — cài bằng double-click thì console đóng
+  là daemon bị kill ngay sau cài dù giao diện báo thành công. Daemon giờ được spawn detached, không cửa sổ, stdio
+  trỏ về NUL nên sống độc lập với tiến trình cài đặt.
+- Daemon tự khởi động cùng Windows trước đây chạy foreground trong Registry Run — mỗi lần boot hiện một cửa sổ console
+  đen tồn tại cả phiên làm việc. Giờ `startup install` và bộ cài đăng ký lệnh `daemon --start --hidden`: tiến trình
+  bootstrap re-exec daemon detached ẩn rồi thoát ngay, chỉ còn nhấp nháy dưới 1 giây lúc boot. Người dùng nâng cấp cần
+  chạy lại `ghitaprint startup install` (bộ cài mới tự ghi đè registry).
+- Bộ cài trước đây hardcode cổng 9123 khi đăng ký máy in ảo — cài lại trên máy đã cấu hình `api_port` khác thì máy in
+  ảo trỏ sai cổng, in từ Word/Chrome thất bại âm thầm. Setup giờ đọc `api_port` từ `%APPDATA%\GhitaPrint\ghitaprint.toml`.
+
+#### 🛠️ Bảo mật & API
+- Local REST API trước đây cho phép bất kỳ website nào browser mở cũng POST được tới `/api/v1/print` (drive-by
+  printing). Thêm khóa cấu hình `api_token`: khi đặt, `/api/v1/print` và `/api/v1/printers` yêu cầu
+  `Authorization: Bearer <token>` (trả 401 nếu sai/thiếu); WebSocket yêu cầu `?token=<token>` khi connect. Token được
+  mask trong `config list`. Không đặt token = hành vi cũ (mở cho web POS localhost).
+- WebSocket `/api/v1/ws` trước đây chỉ trả pong khi nhận "ping" — giờ nhận lệnh `{"event":"print", target, document,
+  raw}` và trả `{"event":"print_result", success, message, bytes_sent}`; JSON sai định dạng trả `{"event":"error"}`.
+  Ping/pong giữ nguyên để tương thích.
+
+#### 🛠️ Sửa khác
+- Gỡ cờ `startup install --service` (trước đây là placeholder không làm gì) — Windows Service sẽ quay lại ở phiên bản sau.
+- `print --image --image-width` giờ clamp 1..=2048 dots ở cả CLI và bên trong encoder raster — guard kép chống tràn
+  `u16` và chống phân bổ bộ nhớ khổng lồ khi truyền giá trị cực lớn.
+- Sửa bộ cài parse `api_port` sai khi config chứa key tương tự (ví dụ `api_port_backup = 5` trước đây bị nhận là cổng
+  5) — giờ so khớp chính xác key sau dấu `=`; logic tách thành hàm thuần với 5 unit tests.
+- Config `ghitaprint.toml` một phần (thiếu field) giờ vẫn giữ giá trị có sẵn thay vì reset toàn bộ về mặc định.
+- Loại bỏ dependency `indicatif` không sử dụng; cập nhật `tokio` 1.53.2 → 1.54.1 — `cargo audit` sạch hoàn toàn
+  (0 vulnerability, 0 warning) trên 182 crates; `cargo fmt` áp dụng toàn bộ mã nguồn.
+
+#### 📦 Tải xuống
+- Bộ cài 1-Click: `GhitaPrint_0.0.1.exe` — cài thường / `--silent` / `--uninstall`, tự thêm PATH, đăng ký tự khởi động
+  ẩn, cài máy in ảo đúng cổng cấu hình và chạy daemon nền ẩn.
+- SHA-256: `cfde256192d808f7d1fa7d3ea9db0830e4b83186441aad462fb3fc76158cff25`
+
+#### ✅ Chất lượng
+- 36 automated tests: 36 passed, 0 failed, 0 warnings; Clippy: 0 warning toàn bộ target; `cargo audit` 0 cảnh báo.
+- E2E verified: daemon `--hidden` bind đúng cổng cấu hình, token 401/200 trên `/print` + `/printers`, WS print
+  end-to-end, `config list` mask token.
+
 ## [0.0.1-preview] — 2026-10-28
 
 ### 🔍 Bản preview sau đợt review & debug toàn bộ mã nguồn

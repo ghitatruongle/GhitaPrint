@@ -94,7 +94,8 @@ impl FloydSteinbergRasterizer {
     }
 
     pub fn to_escpos_raster(img: &DynamicImage, target_width: Option<u32>) -> Vec<u8> {
-        let (bitmap, width, height) = Self::dither(img, target_width);
+        let clamped_width = target_width.map(|w| w.clamp(1, 2048));
+        let (bitmap, width, height) = Self::dither(img, clamped_width);
         let width_bytes = (width / 8) as u16;
         let height_dots = height as u16;
 
@@ -174,5 +175,20 @@ mod tests {
         assert_eq!(w, 8);
         assert_eq!(h, 8);
         assert_eq!(bitmap, vec![0u8; 8]);
+    }
+
+    #[test]
+    fn test_escpos_raster_clamps_extreme_width() {
+        let img = ImageBuffer::from_pixel(8, 8, Rgb([0u8, 0u8, 0u8]));
+        let dyn_img = DynamicImage::ImageRgb8(img);
+
+        let cmd = FloydSteinbergRasterizer::to_escpos_raster(&dyn_img, Some(999_999));
+        let width_bytes = u16::from_le_bytes([cmd[4], cmd[5]]);
+        assert!(width_bytes <= 256);
+        assert!(cmd.len() >= 8);
+
+        let zero_cmd = FloydSteinbergRasterizer::to_escpos_raster(&dyn_img, Some(0));
+        let zero_width_bytes = u16::from_le_bytes([zero_cmd[4], zero_cmd[5]]);
+        assert!(zero_width_bytes >= 1);
     }
 }

@@ -158,14 +158,8 @@ pub struct StartupArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum StartupAction {
-    #[command(about = "Đăng ký ghitaprint.exe tự chạy khi khởi động Windows")]
-    Install {
-        #[arg(
-            long,
-            help = "Cài đặt dưới dạng Windows Service hệ thống thay vì Registry Run"
-        )]
-        service: bool,
-    },
+    #[command(about = "Đăng ký ghitaprint.exe tự chạy ẩn khi khởi động Windows")]
+    Install,
     #[command(about = "Hủy đăng ký tự khởi động cùng Windows")]
     Uninstall,
     #[command(about = "Kiểm tra trạng thái đăng ký tự khởi động")]
@@ -189,4 +183,11 @@ pub struct DaemonArgs {
         help = "Cổng lắng nghe của Local REST & WebSocket API (mặc định theo api_port trong cấu hình)"
     )]
     pub port: Option<u16>,
+
+    #[arg(
+        long,
+        hide = true,
+        help = "Bootstrap ẩn dùng bởi Registry Run/Setup: re-exec daemon detached không cửa sổ"
+    )]
+    pub hidden: bool,
 }

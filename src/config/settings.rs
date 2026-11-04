@@ -4,11 +4,18 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
     pub api_port: u16,
+    #[serde(default)]
     pub default_printer: String,
+    #[serde(default)]
     pub auto_startup: bool,
+    #[serde(default)]
     pub log_level: String,
+    #[serde(default)]
     pub connection_timeout_secs: u64,
+    #[serde(default)]
+    pub api_token: String,
 }
 
 impl Default for Settings {
@@ -19,6 +26,7 @@ impl Default for Settings {
             auto_startup: false,
             log_level: "info".to_string(),
             connection_timeout_secs: 5,
+            api_token: String::new(),
         }
     }
 }
@@ -82,5 +90,39 @@ impl ConfigManager {
 
     pub fn get_path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_config_without_api_token_backcompat() {
+        let content = "api_port = 9123\ndefault_printer = \"usb://0416:5011\"\nauto_startup = true\nlog_level = \"info\"\nconnection_timeout_secs = 5\n";
+        let parsed: Settings =
+            toml::from_str(content).expect("config cũ thiếu api_token phải parse được");
+        assert_eq!(parsed.api_token, "");
+        assert_eq!(parsed.api_port, 9123);
+    }
+
+    #[test]
+    fn test_parse_partial_config_keeps_present_values() {
+        let content = "api_port = 9500\n";
+        let parsed: Settings = toml::from_str(content).expect("config một phần phải parse được");
+        assert_eq!(parsed.api_port, 9500);
+        assert_eq!(parsed.default_printer, "");
+        assert_eq!(parsed.api_token, "");
+    }
+
+    #[test]
+    fn test_config_roundtrip_includes_api_token() {
+        let settings = Settings {
+            api_token: "secret".to_string(),
+            ..Settings::default()
+        };
+        let serialized = toml::to_string_pretty(&settings).unwrap();
+        let parsed: Settings = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.api_token, "secret");
     }
 }

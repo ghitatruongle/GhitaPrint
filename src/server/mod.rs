@@ -13,11 +13,13 @@ pub async fn start_server(
     port: u16,
     default_printer: String,
     timeout_secs: u64,
+    api_token: String,
 ) -> Result<(), std::io::Error> {
     let state = AppState {
         start_time: Instant::now(),
         default_printer,
         timeout_secs,
+        api_token,
     };
 
     let app = create_router(state);
