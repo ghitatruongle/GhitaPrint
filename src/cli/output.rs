@@ -39,7 +39,7 @@ pub fn print_warning(msg: &str) {
     println!("{} {}", "⚠".bright_yellow().bold(), msg);
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct PrinterInfo {
     pub id: String,
     pub name: String,

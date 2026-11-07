@@ -1,7 +1,19 @@
 [package]
 name = "ghitaprint"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
+
+[lib]
+name = "ghitaprint"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghitaprint"
+path = "src/main.rs"
+
+[[bin]]
+name = "setup"
+path = "src/bin/setup.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -13,17 +25,26 @@ serde_json = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 toml = "0.8"
 nusb = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
+base64 = "0.22"
+flate2 = "1"
+sha2 = "0.10"
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http = "1.0"
+tempfile = "3"
+
+[build-dependencies]
+sha2 = "0.10"
 
 [profile.release]
 opt-level = "z"

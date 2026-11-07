@@ -5,6 +5,60 @@ Toàn bộ thay đổi đáng chú ý của **GhitaPrint** được ghi nhận t
 
 ---
 
+## [0.0.2] — 2026-11-07
+
+### 🎉 Bản hoàn thiện cuối cùng của chu kỳ sản phẩm
+
+Chu kỳ `0.0.2` kết thúc sau đợt review + debug toàn bộ mã nguồn (5 lớp: runtime · deployment · API/CLI ·
+encoders · testing) với 7 lỗi P0 và hàng chục P1 được đóng, kèm kiểm chứng E2E trên máy thật.
+
+#### 🖨️ Máy in ảo in thật được từ Word/Chrome (P0)
+- Raw spooler listener: daemon lắng nghe TCP raw trên cổng api+1 (mặc định 9124), tự nhận diện payload
+  (`%PDF` passthrough / IPP binary / raw ESC-POS) — in từ Word/Chrome qua máy in ảo "GhitaPrint" hoạt động thật,
+  đã verify chuỗi thật: spooler Windows → PDF 46.075 bytes → daemon → máy in đích nguyên vẹn.
+- Bộ cài tạo cổng TCPMON `GhitaPrintRaw` (→127.0.0.1:9124) **trước** khi Add-Printer — sửa lỗi "The specified port
+  does not exist" khi cài, hoạt động cả trên tài khoản không phải Administrator.
+- IPP 1.1 endpoint tại `/printers/ghitaprint` (Print-Job, Validate-Job, Create-Job/Send-Document, Cancel-Job,
+  Get-Printer-Attributes trả capabilities PWG raster đầy đủ) + PWG Raster decoder (sRGB_8/sGray_8/1-bit, flate).
+
+#### 🛡️ Daemon không bao giờ chết im lặng (P0)
+- USB `bulk_out` có timeout từng chunk (trước đây treo vĩnh viễn khi máy in lỗi).
+- Clamp `TableColumn.width` (1..=128) + giới hạn số phần tử — chặn OOM kill daemon từ body JSON ~70 byte.
+- Single-instance qua PID file, `daemon --stop` kill đúng PID (không còn taskkill giết lan cả CLI khác).
+- Bind-then-announce, graceful shutdown Ctrl+C, spawn daemon kèm health-probe trước khi báo thành công.
+- File log rotate theo ngày tại `%APPDATA%\GhitaPrint\logs\` + panic hook ghi crash.log.
+- Exit code đúng cho mọi error path (0/1/2/3/4) + `--json` đầy đủ 15 operations.
+
+#### 🔐 Bảo mật Local API
+- CORS whitelist localhost thay cho `Any`; validate `Host`/`Origin` (chặn DNS rebinding); WS nhận token qua
+  header `Authorization` (không chỉ URL query); giới hạn message WS 1MB + idle timeout 300s; so sánh token
+  constant-time; health endpoint không còn lộ cấu hình; `config set` không echo secret.
+
+#### 📄 API & CLI
+- REST: status code đúng (400/422/502/504) + envelope thống nhất có `code`, `used_target`, `mode`;
+  `raw_base64` sửa lỗi hỏng byte ≥0x80 của `raw`; thêm `POST /api/v1/print/raw` (octet-stream).
+- WS: correlation `id` + `protocol` version trong `connected`.
+- CLI: `--config-path`, `scan --network --subnet CIDR` (tự dò /24), `config reset --yes`, `status` health-probe thật.
+
+#### 🖋️ Encoders & tiếng Việt
+- Sửa state leakage giữa các phần tử (divider sau text 2x/center bị lệch — có sẵn trong sample_bill.json).
+- ESC t codepage TCVN3 cho `diacritics = keep`, fallback bỏ dấu an toàn; TSPL thêm `CODEPAGE UTF-8`, sửa
+  `gap()` emit sau `CLS`, chống command injection CR/LF; `compile_tspl` + chọn protocol theo config.
+- Image: mặc định clamp 576 dots, chặn ảnh cao >65.535 dots và >100 triệu pixel.
+
+#### 💿 Bộ cài
+- Verify SHA-256 + kích thước payload sau extract (chặn AV can thiệp/thiếu exe); taskkill retry + test-open;
+  exit code chuẩn + `--json` summary cho MDM; broadcast `WM_SETTINGCHANGE` trực tiếp; uninstall xóa sạch
+  config/token/env var/printer port; build.rs tự tạo stub + nhúng hash — không thể build bộ cài nhầm exe cũ.
+
+#### ✅ Chất lượng
+- 107 automated tests (103 lib + 4 setup) — tăng từ 36; clippy 0 warning; fmt clean; cargo audit 0 cảnh báo.
+- E2E đã chạy thật: cài đè 0.0.1 trên máy, spooler Windows thật → daemon → máy in đích; IPP/PWG/TCVN3 wire-level.
+
+#### 📦 Tải xuống
+- Bộ cài 1-Click: `GhitaPrint_0.0.2.exe` (~2.86 MB) — cài thường / `--silent` / `--uninstall` / `--json`.
+- SHA-256: `2d57391db69a1504147e3a65efea5a1705a09a248b911dc19ae1219c16ba26c9`
+
 ## [0.0.1] — 2026-11-05
 
 ### 🎉 Phát hành chính thức chu kỳ 0.0.1

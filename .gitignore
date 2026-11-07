@@ -4,3 +4,7 @@ ghitaprint.toml
 docs/
 /release
 debug.log
+.mimosa/
+.v2c/
+.e2e/
+tmpwebapp-*.log

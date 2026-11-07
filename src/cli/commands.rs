@@ -21,10 +21,17 @@ pub struct Cli {
         short,
         long,
         global = true,
-        default_value = "info",
-        help = "Mức độ chi tiết log (trace, debug, info, warn, error)"
+        help = "Đường dẫn file cấu hình thay thế (mặc định: %APPDATA%\\GhitaPrint\\ghitaprint.toml)"
     )]
-    pub log_level: String,
+    pub config_path: Option<PathBuf>,
+
+    #[arg(
+        short,
+        long,
+        global = true,
+        help = "Mức độ chi tiết log (trace, debug, info, warn, error) — mặc định theo log_level trong cấu hình"
+    )]
+    pub log_level: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -84,16 +91,37 @@ pub struct ScanArgs {
     #[arg(long, help = "Chỉ quét máy in qua mạng (TCP cổng 9100)")]
     pub network: bool,
 
-    #[arg(long, help = "Chỉ quét máy in Bluetooth")]
+    #[arg(
+        long,
+        help = "Quét subnet chỉ định (ví dụ 192.168.1.0/24) — dùng với --network"
+    )]
+    pub subnet: Option<String>,
+
+    #[arg(
+        long,
+        default_value_t = 1000,
+        help = "Thời gian chờ mỗi máy in mạng (mili giây) — dùng với --network"
+    )]
+    pub timeout_ms: u64,
+
+    #[arg(
+        long,
+        help = "Chỉ quét máy in Bluetooth (chưa hỗ trợ — giữ tương thích cờ cũ)"
+    )]
     pub bluetooth: bool,
 }
 
 #[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("test_mode")
+        .required(true)
+        .args(&["receipt", "label"]),
+))]
 pub struct TestArgs {
     #[arg(long, help = "In hóa đơn nhiệt mẫu test cắt giấy & QR code (ESC/POS)")]
     pub receipt: bool,
 
-    #[arg(long, help = "In tem mã vạch mẫu test (TSPL / ZPL)")]
+    #[arg(long, help = "In tem nhãn mã vạch mẫu test (TSPL)")]
     pub label: bool,
 
     #[arg(
@@ -146,8 +174,11 @@ pub enum ConfigAction {
     Get { key: String },
     #[command(about = "Đặt giá trị cho một khóa cấu hình")]
     Set { key: String, value: String },
-    #[command(about = "Đặt lại cấu hình về mặc định")]
-    Reset,
+    #[command(about = "Đặt lại cấu hình về mặc định (cần --yes để xác nhận)")]
+    Reset {
+        #[arg(long, help = "Xác nhận đặt lại không cần hỏi")]
+        yes: bool,
+    },
 }
 
 #[derive(Args, Debug)]

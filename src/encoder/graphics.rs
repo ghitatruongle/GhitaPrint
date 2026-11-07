@@ -2,27 +2,58 @@ use image::{DynamicImage, GenericImageView};
 
 pub struct FloydSteinbergRasterizer;
 
-#[allow(dead_code)]
+pub const DEFAULT_HEAD_WIDTH_DOTS: u32 = 576;
+pub const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+pub const MAX_RASTER_HEIGHT_DOTS: u32 = 65_535;
+
 impl FloydSteinbergRasterizer {
-    pub fn dither(img: &DynamicImage, target_width: Option<u32>) -> (Vec<u8>, u32, u32) {
-        let resized = if let Some(tw) = target_width {
-            let (w, h) = img.dimensions();
-            let target_h = (h as f32 * (tw as f32 / w as f32)).round() as u32;
-            img.resize_exact(tw, target_h, image::imageops::FilterType::Triangle)
+    pub fn dither(
+        img: &DynamicImage,
+        target_width: Option<u32>,
+    ) -> Result<(Vec<u8>, u32, u32), String> {
+        let (w, h) = img.dimensions();
+        if w == 0 || h == 0 {
+            return Err("Ảnh rỗng hoặc không hợp lệ".to_string());
+        }
+        if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+            return Err(format!(
+                "Ảnh quá lớn ({} điểm ảnh) — tối đa {} triệu điểm ảnh",
+                (w as u64) * (h as u64),
+                MAX_IMAGE_PIXELS / 1_000_000
+            ));
+        }
+
+        let max_width = target_width
+            .unwrap_or(DEFAULT_HEAD_WIDTH_DOTS)
+            .clamp(1, 2048);
+        let eff_w = w.min(max_width);
+
+        let resized_owned;
+        let source: &DynamicImage = if eff_w != w {
+            let target_h = (((h as f64) * (eff_w as f64 / w as f64)).round() as u32).max(1);
+            resized_owned =
+                img.resize_exact(eff_w, target_h, image::imageops::FilterType::Triangle);
+            &resized_owned
         } else {
-            img.clone()
+            img
         };
 
-        let (raw_w, height) = resized.dimensions();
+        let (raw_w, height) = source.dimensions();
         if raw_w == 0 || height == 0 {
-            return (Vec::new(), 0, 0);
+            return Err("Ảnh sau khi co giãn rỗng".to_string());
+        }
+        if height > MAX_RASTER_HEIGHT_DOTS {
+            return Err(format!(
+                "Ảnh cao {} dots vượt giới hạn máy in {} dots — hãy cắt ảnh ngắn lại hoặc giảm --image-width",
+                height, MAX_RASTER_HEIGHT_DOTS
+            ));
         }
 
         let width = raw_w.div_ceil(8) * 8;
         let width_usize = width as usize;
         let height_usize = height as usize;
 
-        let rgba = resized.to_rgba8();
+        let rgba = source.to_rgba8();
         let raw_bytes = rgba.as_raw();
         let mut pixels = vec![255.0f32; width_usize * height_usize];
 
@@ -90,12 +121,14 @@ impl FloydSteinbergRasterizer {
             }
         }
 
-        (bitmap, width, height)
+        Ok((bitmap, width, height))
     }
 
-    pub fn to_escpos_raster(img: &DynamicImage, target_width: Option<u32>) -> Vec<u8> {
-        let clamped_width = target_width.map(|w| w.clamp(1, 2048));
-        let (bitmap, width, height) = Self::dither(img, clamped_width);
+    pub fn to_escpos_raster(
+        img: &DynamicImage,
+        target_width: Option<u32>,
+    ) -> Result<Vec<u8>, String> {
+        let (bitmap, width, height) = Self::dither(img, target_width)?;
         let width_bytes = (width / 8) as u16;
         let height_dots = height as u16;
 
@@ -111,21 +144,21 @@ impl FloydSteinbergRasterizer {
             ((height_dots >> 8) & 0xFF) as u8,
         ]);
         cmd.extend_from_slice(&bitmap);
-        cmd
+        Ok(cmd)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ImageBuffer, Rgb};
+    use image::{ImageBuffer, Rgb, Rgba};
 
     #[test]
     fn test_floyd_steinberg_dithering() {
         let img = ImageBuffer::from_pixel(16, 16, Rgb([128u8, 128u8, 128u8]));
         let dyn_img = DynamicImage::ImageRgb8(img);
 
-        let (bitmap, w, h) = FloydSteinbergRasterizer::dither(&dyn_img, None);
+        let (bitmap, w, h) = FloydSteinbergRasterizer::dither(&dyn_img, None).expect("dither OK");
         assert_eq!(w, 16);
         assert_eq!(h, 16);
         assert_eq!(bitmap.len(), 32);
@@ -141,7 +174,7 @@ mod tests {
         let img = ImageBuffer::from_pixel(8, 8, Rgb([0u8, 0u8, 0u8]));
         let dyn_img = DynamicImage::ImageRgb8(img);
 
-        let cmd = FloydSteinbergRasterizer::to_escpos_raster(&dyn_img, None);
+        let cmd = FloydSteinbergRasterizer::to_escpos_raster(&dyn_img, None).expect("raster OK");
         assert_eq!(&cmd[0..4], &[0x1D, 0x76, 0x30, 0x00]);
         assert_eq!(cmd[4], 1);
         assert_eq!(cmd[5], 0);
@@ -151,27 +184,11 @@ mod tests {
     }
 
     #[test]
-    fn test_create_sample_png_and_dither() {
-        let mut img = ImageBuffer::new(64, 64);
-        for (x, y, pixel) in img.enumerate_pixels_mut() {
-            if (x + y) % 4 == 0 {
-                *pixel = Rgb([0u8, 0u8, 0u8]);
-            } else {
-                *pixel = Rgb([200u8, 200u8, 200u8]);
-            }
-        }
-        let dyn_img = DynamicImage::ImageRgb8(img);
-        dyn_img.save("test_logo.png").unwrap();
-        assert!(std::path::Path::new("test_logo.png").exists());
-    }
-
-    #[test]
     fn test_transparent_png_blends_to_white() {
-        use image::Rgba;
         let img = ImageBuffer::from_pixel(8, 8, Rgba([0u8, 0u8, 0u8, 0u8]));
         let dyn_img = DynamicImage::ImageRgba8(img);
 
-        let (bitmap, w, h) = FloydSteinbergRasterizer::dither(&dyn_img, None);
+        let (bitmap, w, h) = FloydSteinbergRasterizer::dither(&dyn_img, None).expect("dither OK");
         assert_eq!(w, 8);
         assert_eq!(h, 8);
         assert_eq!(bitmap, vec![0u8; 8]);
@@ -182,13 +199,68 @@ mod tests {
         let img = ImageBuffer::from_pixel(8, 8, Rgb([0u8, 0u8, 0u8]));
         let dyn_img = DynamicImage::ImageRgb8(img);
 
-        let cmd = FloydSteinbergRasterizer::to_escpos_raster(&dyn_img, Some(999_999));
+        let cmd =
+            FloydSteinbergRasterizer::to_escpos_raster(&dyn_img, Some(999_999)).expect("raster OK");
         let width_bytes = u16::from_le_bytes([cmd[4], cmd[5]]);
         assert!(width_bytes <= 256);
         assert!(cmd.len() >= 8);
 
-        let zero_cmd = FloydSteinbergRasterizer::to_escpos_raster(&dyn_img, Some(0));
+        let zero_cmd = FloydSteinbergRasterizer::to_escpos_raster(&dyn_img, Some(0)).expect("OK");
         let zero_width_bytes = u16::from_le_bytes([zero_cmd[4], zero_cmd[5]]);
         assert!(zero_width_bytes >= 1);
+    }
+
+    #[test]
+    fn test_default_width_clamps_wide_image() {
+        let img = ImageBuffer::from_pixel(2000, 10, Rgb([128u8, 128u8, 128u8]));
+        let dyn_img = DynamicImage::ImageRgb8(img);
+        let (bitmap, w, h) = FloydSteinbergRasterizer::dither(&dyn_img, None).expect("dither OK");
+        assert_eq!(w, 576);
+        assert_eq!(h, 3);
+        assert_eq!(bitmap.len(), (576 / 8) * 3);
+    }
+
+    #[test]
+    fn test_small_image_not_upscaled_by_default() {
+        let img = ImageBuffer::from_pixel(64, 64, Rgb([128u8, 128u8, 128u8]));
+        let dyn_img = DynamicImage::ImageRgb8(img);
+        let (_, w, h) = FloydSteinbergRasterizer::dither(&dyn_img, None).expect("dither OK");
+        assert_eq!(w, 64);
+        assert_eq!(h, 64);
+    }
+
+    #[test]
+    fn test_tall_image_rejected() {
+        let img = ImageBuffer::from_pixel(10, 70_000, Rgb([0u8, 0u8, 0u8]));
+        let dyn_img = DynamicImage::ImageRgb8(img);
+        let err = FloydSteinbergRasterizer::dither(&dyn_img, None).unwrap_err();
+        assert!(err.contains("vượt giới hạn"));
+    }
+
+    #[test]
+    fn test_empty_image_rejected() {
+        let img = ImageBuffer::from_pixel(0, 0, Rgb([0u8, 0u8, 0u8]));
+        let dyn_img = DynamicImage::ImageRgb8(img);
+        let err = FloydSteinbergRasterizer::dither(&dyn_img, None).unwrap_err();
+        assert!(err.contains("rỗng"));
+    }
+
+    #[test]
+    fn test_huge_pixel_count_rejected() {
+        let w: u32 = 12_000;
+        let h: u32 = 10_000;
+        let img = ImageBuffer::from_fn(w, h, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 128u8]));
+        let dyn_img = DynamicImage::ImageRgb8(img);
+        let err = FloydSteinbergRasterizer::dither(&dyn_img, None).unwrap_err();
+        assert!(err.contains("quá lớn"));
+    }
+
+    #[test]
+    fn test_degenerate_aspect_ratio_not_empty() {
+        let img = ImageBuffer::from_pixel(10_000, 1, Rgb([0u8, 0u8, 0u8]));
+        let dyn_img = DynamicImage::ImageRgb8(img);
+        let cmd = FloydSteinbergRasterizer::to_escpos_raster(&dyn_img, Some(2048)).expect("OK");
+        let height = u16::from_le_bytes([cmd[6], cmd[7]]);
+        assert!(height >= 1);
     }
 }
