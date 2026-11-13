@@ -14,6 +14,7 @@ const EMBEDDED_SHA256: &str = env!("GHITAPRINT_EMBEDDED_SHA256");
 const EMBEDDED_SIZE_STR: &str = env!("GHITAPRINT_EMBEDDED_SIZE");
 
 const APP_NAME: &str = "GhitaPrint";
+const APP_NAME_WATCH: &str = "GhitaPrintWatch";
 const REG_RUN_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STUB_PREFIX: &[u8] = b"GHITAPRINT-STUB";
 
@@ -187,9 +188,11 @@ fn broadcast_environment_change() {
 #[cfg(windows)]
 fn install_registry_run(exe_path: &Path) -> std::io::Result<()> {
     let cmd = format!("\"{}\" daemon --start --hidden", exe_path.display());
+    let watch_cmd = format!("\"{}\" watch", exe_path.display());
     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
     let (key, _) = hkcu.create_subkey(REG_RUN_PATH)?;
     key.set_value(APP_NAME, &cmd)?;
+    key.set_value(APP_NAME_WATCH, &watch_cmd)?;
     Ok(())
 }
 
@@ -198,6 +201,7 @@ fn uninstall_registry_run() {
     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
     if let Ok(key) = hkcu.open_subkey_with_flags(REG_RUN_PATH, winreg::enums::KEY_WRITE) {
         let _ = key.delete_value(APP_NAME);
+        let _ = key.delete_value(APP_NAME_WATCH);
     }
 }
 

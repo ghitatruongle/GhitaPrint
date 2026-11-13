@@ -1,5 +1,68 @@
 use std::path::Path;
 
+pub fn quote_command_line_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && !argument.contains([' ', '\t', '\n', '"'])
+        && !argument.ends_with('\\')
+    {
+        return argument.to_string();
+    }
+    let mut quoted = String::with_capacity(argument.len() + 2);
+    quoted.push('"');
+    let mut pending_backslashes = 0usize;
+    for character in argument.chars() {
+        match character {
+            '\\' => {
+                pending_backslashes += 1;
+            }
+            '"' => {
+                let escapes = pending_backslashes * 2 + 1;
+                quoted.push_str(&"\\".repeat(escapes));
+                pending_backslashes = 0;
+                quoted.push('"');
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(pending_backslashes));
+                pending_backslashes = 0;
+                quoted.push(character);
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(pending_backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(windows)]
+pub fn process_image_name(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_QUERY_LIMITED_INFORMATION, OpenProcess, QueryFullProcessImageNameW,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 1024];
+    let mut length = buffer.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length)
+    };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if ok == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..length as usize]))
+}
+
+#[cfg(not(windows))]
+pub fn process_image_name(_pid: u32) -> Option<String> {
+    None
+}
+
 #[cfg(windows)]
 pub fn spawn_detached(exe_path: &Path, arguments: &[&str]) -> Result<u32, String> {
     use std::ffi::OsStr;
@@ -10,12 +73,14 @@ pub fn spawn_detached(exe_path: &Path, arguments: &[&str]) -> Result<u32, String
         STARTUPINFOW,
     };
 
-    let mut command_line: Vec<u16> = OsStr::new(&format!("\"{}\"", exe_path.display()))
-        .encode_wide()
-        .collect();
+    let mut command_line: Vec<u16> = OsStr::new(&quote_command_line_argument(
+        &exe_path.display().to_string(),
+    ))
+    .encode_wide()
+    .collect();
     for argument in arguments {
         command_line.push(b' ' as u16);
-        command_line.extend(OsStr::new(argument).encode_wide());
+        command_line.extend(OsStr::new(&quote_command_line_argument(argument)).encode_wide());
     }
     command_line.push(0);
 
@@ -94,6 +159,37 @@ pub fn probe_health_sync(port: u16, attempts: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_quote_argument_roundtrip_simple_and_tricky() {
+        assert_eq!(quote_command_line_argument("daemon"), "daemon");
+        assert_eq!(
+            quote_command_line_argument("C:\\đường dẫn có dấu cách\\x.exe"),
+            "\"C:\\đường dẫn có dấu cách\\x.exe\""
+        );
+        assert_eq!(
+            quote_command_line_argument("ghi\"chép"),
+            "\"ghi\\\"chép\""
+        );
+        assert_eq!(quote_command_line_argument("C:\\folder\\"), "\"C:\\folder\\\\\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_process_image_name_resolves_current_process() {
+        let expected = std::env::current_exe()
+            .unwrap()
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let actual = process_image_name(std::process::id())
+            .map(|full| std::path::Path::new(&full)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default())
+            .unwrap_or_default();
+        assert_eq!(actual, expected, "tên image của tiến trình hiện tại phải khớp");
+    }
 
     #[test]
     fn test_probe_health_sync_unreachable_port() {

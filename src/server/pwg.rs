@@ -5,6 +5,9 @@ pub struct PwgPage {
 }
 
 const HEADER_SIZE: usize = 64;
+pub const MAX_INFLATED_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_PWGS_PIXELS_PER_PAGE: u64 = 40_000_000;
+pub const MAX_TOTAL_RGBA_BYTES: usize = 256 * 1024 * 1024;
 
 fn read_u32_be(data: &[u8], offset: usize) -> Option<u32> {
     let bytes = data.get(offset..offset + 4)?;
@@ -55,22 +58,47 @@ fn looks_like_pwg_header(
         && (channels == 1 || channels == 3 || channels == 4)
 }
 
-fn inflate_bytes(raw: &[u8]) -> Result<Vec<u8>, String> {
+enum InflateFailure {
+    ExceedsLimit,
+    Corrupt(String),
+}
+
+fn inflate_with_cap<R: std::io::Read>(reader: R) -> Result<Vec<u8>, InflateFailure> {
     use std::io::Read;
-    let mut zlib_out = Vec::new();
-    if flate2::read::ZlibDecoder::new(raw)
-        .read_to_end(&mut zlib_out)
-        .is_ok()
-        && !zlib_out.is_empty()
-    {
-        return Ok(zlib_out);
-    }
-    let mut decoder = flate2::read::DeflateDecoder::new(raw);
+    let mut limited = reader.take((MAX_INFLATED_BYTES + 1) as u64);
     let mut out = Vec::new();
-    decoder
+    limited
         .read_to_end(&mut out)
-        .map_err(|e| format!("Không thể giải nén dữ liệu PWG (flate): {}", e))?;
+        .map_err(|e| InflateFailure::Corrupt(format!("{}", e)))?;
+    if out.len() > MAX_INFLATED_BYTES {
+        return Err(InflateFailure::ExceedsLimit);
+    }
     Ok(out)
+}
+
+fn inflate_bytes(raw: &[u8]) -> Result<Vec<u8>, String> {
+    match inflate_with_cap(flate2::read::ZlibDecoder::new(raw)) {
+        Ok(out) if !out.is_empty() => return Ok(out),
+        Err(InflateFailure::ExceedsLimit) => {
+            return Err(format!(
+                "PWG: dữ liệu giải nén vượt giới hạn {} MB — nghi ngờ zlib bomb, đã chặn",
+                MAX_INFLATED_BYTES / (1024 * 1024)
+            ));
+        }
+        Err(InflateFailure::Corrupt(_)) => {}
+        Ok(_) => {}
+    }
+    match inflate_with_cap(flate2::read::DeflateDecoder::new(raw)) {
+        Ok(out) => Ok(out),
+        Err(InflateFailure::ExceedsLimit) => Err(format!(
+            "PWG: dữ liệu giải nén vượt giới hạn {} MB — nghi ngờ zlib bomb, đã chặn",
+            MAX_INFLATED_BYTES / (1024 * 1024)
+        )),
+        Err(InflateFailure::Corrupt(e)) => Err(format!(
+            "Không thể giải nén dữ liệu PWG (flate): {}",
+            e
+        )),
+    }
 }
 
 pub fn decode_pwg_document(data: &[u8], compression: Option<&str>) -> Result<Vec<PwgPage>, String> {
@@ -80,6 +108,7 @@ pub fn decode_pwg_document(data: &[u8], compression: Option<&str>) -> Result<Vec
 
     let mut pages = Vec::new();
     let mut offset = 0usize;
+    let mut total_rgba_bytes = 0usize;
 
     while offset + HEADER_SIZE <= data.len() {
         let Some((
@@ -98,6 +127,16 @@ pub fn decode_pwg_document(data: &[u8], compression: Option<&str>) -> Result<Vec
 
         if !looks_like_pwg_header(res_x, res_y, width, height, bits_per_pixel, channels) {
             break;
+        }
+
+        let page_pixels = (width as u64) * (height as u64);
+        if page_pixels > MAX_PWGS_PIXELS_PER_PAGE {
+            return Err(format!(
+                "PWG: trang {}x{} vượt giới hạn {} triệu điểm ảnh mỗi trang — chặn trước khi cấp phát bộ nhớ",
+                width,
+                height,
+                MAX_PWGS_PIXELS_PER_PAGE / 1_000_000
+            ));
         }
 
         let image_data_size = read_u32_be(data, offset + 36).unwrap_or(0) as usize;
@@ -142,7 +181,7 @@ pub fn decode_pwg_document(data: &[u8], compression: Option<&str>) -> Result<Vec
             let row = &payload[y * row_stride..(y + 1) * row_stride];
             if is_one_bit {
                 for x in 0..width as usize {
-                    let byte = row.get(x / 8).copied().unwrap_or(0xFF);
+                    let byte = row.get(x/8).copied().unwrap_or(0xFF);
                     let bit_set = (byte >> (7 - (x % 8))) & 1 == 1;
                     let value = if bit_set { 0u8 } else { 255u8 };
                     rgba.extend_from_slice(&[value, value, value, 255]);
@@ -156,6 +195,14 @@ pub fn decode_pwg_document(data: &[u8], compression: Option<&str>) -> Result<Vec
                     rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
                 }
             }
+        }
+
+        total_rgba_bytes = total_rgba_bytes.saturating_add(rgba.len());
+        if total_rgba_bytes > MAX_TOTAL_RGBA_BYTES {
+            return Err(format!(
+                "PWG: tổng bộ nhớ trang raster vượt {} MB — chặn trước khi tích lũy quá nhiều trang",
+                MAX_TOTAL_RGBA_BYTES / (1024 * 1024)
+            ));
         }
 
         pages.push(PwgPage {
@@ -280,5 +327,49 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].rgba[0], 0);
         assert_eq!(pages[1].rgba[0], 255);
+    }
+
+    #[test]
+    fn test_inflate_cap_blocks_zlib_bomb() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let bomb_payload = vec![0u8; MAX_INFLATED_BYTES + 1024];
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&bomb_payload)
+            .expect("nén payload bomb phải thành công");
+        let compressed = encoder.finish().expect("finish bomb phải thành công");
+
+        let width = 4u32;
+        let height = 1u32;
+        let mut data = make_header(600, width, height, 8, 18, 3, 8, compressed.len() as u32);
+        data.extend_from_slice(&compressed);
+
+        let result = decode_pwg_document(&data, Some("flate"));
+        let error = result.err().expect("zlib bomb phải bị từ chối");
+        assert!(
+            error.contains("vượt giới hạn"),
+            "thông điệp phải nêu giới hạn, nhận: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn test_pixel_guard_rejects_huge_page_before_allocation() {
+        let width = 10_000u32;
+        let height = 20_000u32;
+        let mut data = make_header(600, width, height, 8, 19, 1, 8, 8);
+        data.extend_from_slice(&[0u8; 8]);
+
+        let error = decode_pwg_document(&data, None)
+            .err()
+            .expect("trang 200 triệu điểm ảnh phải bị từ chối");
+        assert!(
+            error.contains("điểm ảnh"),
+            "thông điệp phải nêu giới hạn điểm ảnh, nhận: {}",
+            error
+        );
     }
 }

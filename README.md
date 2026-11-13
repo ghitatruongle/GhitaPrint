@@ -9,9 +9,9 @@
 
 1. **Không cần cài driver hãng:** Kết nối trực tiếp máy in USB (qua Bulk OUT Endpoint với `nusb`), máy in mạng (TCP 9100 JetDirect) và máy in ảo Windows (Microsoft IPP Class Driver) mà không cần cài driver từ đĩa/hãng (Xprinter, Epson, Zebra, Brother, Canon...).
 2. **Siêu nhẹ & Tốc độ cao:** 
-   * Viết bằng Rust thuần, Single Binary **chỉ 1.97 MB** (nhỏ gấp 50 lần so với Java/Electron).
+   * Viết bằng Rust thuần, Single Binary **chỉ ~2.4 MB** (nhỏ gấp 40 lần so với Java/Electron).
    * Tiêu thụ chỉ **~12 MB RAM** khi chạy nền (đo thực tế).
-   * Khởi động tức thì trong **0.05 giây**.
+   * REST API sẵn sàng chỉ sau **~3 ms** boot→ready (đo thực tế 0.0.3-preview).
 3. **100% Điều khiển qua CLI (CLI-First):** Quét cổng, cấu hình, in thử nghiệm, bật tự khởi động cùng Windows, và quản lý máy in ảo hoàn toàn bằng dòng lệnh terminal.
 
 ---
@@ -52,6 +52,13 @@ ghitaprint virtual-printer uninstall # Gỡ bỏ máy in ảo
 
 # 7. Khởi chạy Local REST & WebSocket Server (Daemon)
 ghitaprint daemon --start --port 9123
+
+# 8. Companion theo dõi sự kiện in (khởi chạy cùng Windows qua startup install)
+ghitaprint watch                     # Ghi nhật ký events.log + toast Windows khi in lỗi
+ghitaprint watch --no-toast          # Chỉ ghi events.log, tắt toast
+
+# 9. Trạng thái tức thì (đọc status.json, không cần probe)
+ghitaprint status
 ```
 
 ---
@@ -68,9 +75,10 @@ ghitaprint daemon --start --port 9123
 ├──────────────────────────┬─────────────────────────────┤
 │      Encoders & Parser   │     Connection Transport    │
 │  • ESC/POS Builder       │  • Raw TCP (Socket 9100)    │
-│  • TSPL / ZPL Builder    │  • Driverless USB (nusb)    │
-│  • Floyd-Steinberg Dither│  • Virtual IPP Print Spooler│
-│  • Document JSON Schema  │  • Bluetooth SPP / BLE      │
+│  • TSPL Builder (ZPL: kế │  • Driverless USB (nusb)    │
+│    hoạch)                │  • Virtual IPP Print Spooler│
+│  • Floyd-Steinberg Dither│  • Bluetooth SPP/BLE: kế hoạch│
+│  • Document JSON Schema  │                             │
 └──────────────────────────┴─────────────────────────────┘
 ```
 
@@ -78,43 +86,45 @@ ghitaprint daemon --start --port 9123
 
 ## 🧪 4. Kiểm thử tự động (Unit Tests)
 
-Dự án bao gồm bộ 36 automated tests kiểm tra toàn bộ luồng truyền nhận, mã hóa và máy chủ API:
+Dự án bao gồm bộ **132 automated tests** kiểm tra toàn bộ luồng truyền nhận, mã hóa, máy chủ API và các đường bảo vệ:
 
 ```bash
 cargo test
 ```
 
-Kết quả: **36 passed, 0 failed, 0 warnings**.
+Kết quả: **132 passed, 0 failed, 0 clippy warnings**.
 
 ---
 
-## 📦 5. Bộ Cài Đặt 1-Click Duy Nhất (`GhitaPrint_0.0.1.exe`)
+## 📦 5. Bộ Cài Đặt 1-Click Duy Nhất (`GhitaPrint_0.0.3-preview.exe`)
 
 Bản phát hành kèm duy nhất bộ cài độc lập:
 
-* **Bản phát hành:** `GhitaPrint_0.0.1.exe` (~2.2 MB) — tải từ [GitHub Releases](https://github.com/ghitatruongle/GhitaPrint/releases) (bộ cài không nằm trong mã nguồn git)
+* **Bản phát hành:** `GhitaPrint_0.0.3-preview.exe` (~2.2 MB) — tải từ [GitHub Releases](https://github.com/ghitatruongle/GhitaPrint/releases) (bộ cài không nằm trong mã nguồn git)
 * **Tự động hóa hoàn toàn:**
   1. Trích xuất file thực thi `ghitaprint.exe` vào `%LocalAppData%\Programs\GhitaPrint`.
-  2. Tự động thêm vào biến môi trường **PATH** để gõ lệnh `ghitaprint` ở mọi terminal.
-  3. Đăng ký **Tự khởi động cùng Windows** (`HKCU\...\Run`).
+  2. Tự động thêm vào biến môi trường **PATH**.
+  3. Đăng ký **Tự khởi động cùng Windows** (daemon + watch companion, `HKCU\...\Run`).
   4. Cài đặt **Máy in ảo Windows** (Microsoft IPP Class Driver).
   5. Khởi chạy **Daemon nền** kết nối sẵn sàng.
+* **Kênh giao tiếp người dùng 0.0.3-preview:** daemon ghi `status.json` + `events.log` qua `ghitaprint watch`;
+  lịch sử job qua `GET /api/v1/jobs`.
 
 ```bash
 # Cài đặt thông thường (hiện giao diện CLI đẹp mắt)
-.\GhitaPrint_0.0.1.exe
+.\GhitaPrint_0.0.3-preview.exe
 
 # Cài đặt ẩn tự động (Silent / Unattended mode)
-.\GhitaPrint_0.0.1.exe --silent
+.\GhitaPrint_0.0.3-preview.exe --silent
 
 # Gỡ cài đặt sạch sẽ khỏi máy tính
-.\GhitaPrint_0.0.1.exe --uninstall
+.\GhitaPrint_0.0.3-preview.exe --uninstall
 ```
 
 ### Cách build lại bộ cài đặt:
 ```bash
 cargo build --release --bin ghitaprint
 cargo build --release --bin setup
-Copy-Item target\release\setup.exe release\GhitaPrint_0.0.1.exe -Force
+Copy-Item target\release\setup.exe release\GhitaPrint_0.0.3-preview.exe -Force
 ```
 

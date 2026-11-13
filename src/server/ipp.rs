@@ -1,5 +1,5 @@
 use super::pwg;
-use super::routes::{AppState, JobRecord};
+use super::routes::AppState;
 use crate::encoder::FloydSteinbergRasterizer;
 use crate::server::execute_print;
 use image::DynamicImage;
@@ -398,13 +398,6 @@ pub async fn handle_ipp_request(state: &AppState, body: &[u8]) -> (Vec<u8>, Stri
         OP_PRINT_JOB => print_job(state, &request, None).await,
         OP_CREATE_JOB => {
             let job_id = state.allocate_job_id() as i32;
-            state
-                .record_job(JobRecord {
-                    id: job_id as u32,
-                    state: "pending".to_string(),
-                    message: "IPP Create-Job".to_string(),
-                })
-                .await;
             let response = build_response(
                 request.version,
                 request.request_id,
@@ -517,7 +510,7 @@ async fn print_job(
         }
     };
 
-    let outcome = execute_print(state, None, &bytes, "ipp").await;
+    let outcome = execute_print(state, "ipp", None, &bytes, "ipp").await;
     let (status, job_state, message) = if outcome.success {
         (STATUS_OK, JOB_STATE_COMPLETED, outcome.message.clone())
     } else {
@@ -527,18 +520,6 @@ async fn print_job(
             outcome.message.clone(),
         )
     };
-
-    state
-        .record_job(JobRecord {
-            id: job_id as u32,
-            state: if outcome.success {
-                "completed".to_string()
-            } else {
-                "aborted".to_string()
-            },
-            message: outcome.message.clone(),
-        })
-        .await;
 
     let response = build_response(
         request.version,

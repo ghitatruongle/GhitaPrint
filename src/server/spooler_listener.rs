@@ -2,6 +2,7 @@ use super::ipp;
 use super::routes::{AppState, execute_print};
 
 pub const RAW_READ_TIMEOUT_SECS: u64 = 60;
+pub const MAX_SPOOLER_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 
 pub enum SpoolerPayload<'a> {
     Pdf(&'a [u8]),
@@ -26,7 +27,7 @@ pub async fn handle_spooler_connection(state: &AppState, payload: &[u8]) -> Stri
 
     match classify_spooler_payload(payload) {
         SpoolerPayload::Pdf(data) => {
-            let outcome = execute_print(state, None, data, "pdf_passthrough").await;
+            let outcome = execute_print(state, "spooler", None, data, "pdf_passthrough").await;
             format!(
                 "Spooler PDF passthrough: {} bytes → {}",
                 data.len(),
@@ -43,7 +44,7 @@ pub async fn handle_spooler_connection(state: &AppState, payload: &[u8]) -> Stri
             log_line
         }
         SpoolerPayload::Raw(data) => {
-            let outcome = execute_print(state, None, data, "raw_passthrough").await;
+            let outcome = execute_print(state, "spooler", None, data, "raw_passthrough").await;
             format!(
                 "Spooler raw passthrough: {} bytes → {}",
                 data.len(),
@@ -87,7 +88,7 @@ pub async fn run_raw_listener_on(
         tokio::spawn(async move {
             let read_result = tokio::time::timeout(
                 std::time::Duration::from_secs(RAW_READ_TIMEOUT_SECS),
-                read_connection(&mut socket),
+                read_connection(&mut socket, MAX_SPOOLER_PAYLOAD_BYTES),
             )
             .await;
 
@@ -113,7 +114,10 @@ pub async fn run_raw_listener_on(
     }
 }
 
-async fn read_connection(socket: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+async fn read_connection(
+    socket: &mut tokio::net::TcpStream,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
 
     let mut payload = Vec::with_capacity(64 * 1024);
@@ -122,6 +126,15 @@ async fn read_connection(socket: &mut tokio::net::TcpStream) -> std::io::Result<
         let read_bytes = socket.read(&mut buffer).await?;
         if read_bytes == 0 {
             break;
+        }
+        if payload.len().saturating_add(read_bytes) > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Payload spooler vượt giới hạn {} MB — ngắt kết nối",
+                    max_bytes / (1024 * 1024)
+                ),
+            ));
         }
         payload.extend_from_slice(&buffer[..read_bytes]);
     }
@@ -172,5 +185,48 @@ mod tests {
             classify_spooler_payload(&empty),
             SpoolerPayload::Raw(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_read_connection_enforces_payload_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            use tokio::io::AsyncWriteExt;
+            let chunk = vec![0u8; 1024];
+            for _ in 0..4 {
+                socket.write_all(&chunk).await.unwrap();
+            }
+        });
+
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let result = read_connection(&mut socket, 2048).await;
+        assert!(result.is_err(), "vượt 2048 bytes phải bị từ chối");
+        let message = result.err().unwrap().to_string();
+        assert!(message.contains("vượt giới hạn"));
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_connection_accepts_payload_under_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            use tokio::io::AsyncWriteExt;
+            socket.write_all(&[7u8; 100]).await.unwrap();
+        });
+
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let payload = read_connection(&mut socket, 2048)
+            .await
+            .expect("payload nhỏ hơn cap phải được chấp nhận");
+        assert_eq!(payload.len(), 100);
+        writer.await.unwrap();
     }
 }

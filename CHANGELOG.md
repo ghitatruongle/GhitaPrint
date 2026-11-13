@@ -5,6 +5,62 @@ Toàn bộ thay đổi đáng chú ý của **GhitaPrint** được ghi nhận t
 
 ---
 
+## [0.0.3-preview] — 2026-11-10
+
+### 🛡️ Bảo mật — vá 6 lỗ hổng từ audit sâu (S1–S6)
+- **S1 (cao):** IPP `/printers/ghitaprint` giờ chặn request mang dấu hiệu trình duyệt (`Origin`/`Sec-Fetch-Site`)
+  khi chưa có `api_token` — hết CSRF-print từ web; spooler Windows (không gửi Origin) in bình thường.
+  `/api/v1/print*` chặn cross-site origin khi chưa cấu hình token; có token thì yêu cầu token như cũ.
+- **S2 (cao):** chặn zlib bomb PWG: giải nén cap 64 MB, chặn trang raster > 40 triệu điểm ảnh **trước** khi cấp
+  phát RGBA (trước đây `Vec::with_capacity` tới 16 GB → abort daemon), cap tổng 256 MB raster tích lũy.
+- **S3:** raw spooler listener cap payload 256 MB (trước đây stream vô hạn → OOM).
+- **S4:** chống PID-reuse khi `daemon --stop`: xác minh tên process qua `QueryFullProcessImageNameW` trước khi
+  `TerminateProcess`; panic hook xóa `daemon.pid`; ghi pid file cảnh báo khi ghi đè daemon sống.
+- **S5:** `printer_locks`/`jobs` có giới hạn (256 lock / 200 job ring buffer); WS giới hạn 8 lệnh in đồng thời
+  (phản hồi `busy` khi vượt).
+- **S6:** log rotate dọn file cũ hơn 7 ngày + crash.log > 5 MB ép xoay; daemon **từ chối khởi động** khi
+  `ghitaprint.toml` trong thư mục hiện tại đè config hệ thống; `spawn_detached` quote argument chuẩn Windows.
+
+### ⚡ Khởi động tức thì
+- Kiểm tra máy in ảo (PowerShell) rời khỏi đường khởi động — chạy nền **sau khi bind**, daemon chỉ cảnh báo
+  tự cài lại; REST API sẵn sàng chỉ sau **~3 ms** boot→ready (đo thực tế; trước đây 1–4 s do PowerShell chặn).
+- Bootstrap `daemon --start --hidden` thoát ngay sau spawn (**72 ms**, trước đây chờ health ~8 s) — hết flash
+  console lúc boot; setup.exe giữ health probe riêng.
+- `/api/v1/health` + status.json ghi `ready_after_ms` đo boot→ready thực tế.
+
+### 📡 Kênh giao tiếp người dùng (status.json + watch companion)
+- Mọi lệnh in REST/WS/IPP/spooler được **log đầy đủ** (trước đây `execute_print` không log) + record vào vòng
+  đời job thống nhất; endpoint mới `GET /api/v1/jobs`.
+- **`status.json`** tại `%APPDATA%\GhitaPrint\` ghi atomic mỗi sự kiện: pid/port/version, boot→ready, bộ đếm
+  in, last_error, 20 job gần nhất, trạng thái máy in ảo.
+- **`ghitaprint watch`** — companion siêu nhẹ (~455 KB, start tức thì, không runtime tokio): theo dõi
+  status.json → ghi nhật ký dễ đọc `events.log` + **toast Windows** khi in lỗi; phát hiện daemon chết theo PID.
+  `startup install` đăng ký kèm watch (Registry Run `GhitaPrintWatch`); bộ cài tự đăng ký cả hai.
+- `ghitaprint status` tức thì từ status.json — hiện boot→ready, thống kê in, 5 job gần nhất.
+
+### 📄 Khác
+- Cargo version `0.0.3-preview`; 132 automated tests (từ 107) — thêm test cho IPP guard, zlib bomb, spooler
+  cap, PID-reuse, status file, jobs API, ring buffer, quote argument; clippy 0 warning.
+- `ghitaprint.exe` release ~2.4 MB; `watch.exe` ~455 KB.
+
+### 🔍 Review & debug toàn bộ mã nguồn (pass cuối trước phát hành)
+- **watch là subcommand thật:** logic watch chuyển vào library (`src/watch.rs`); `ghitaprint watch` chạy
+  trực tiếp trên exe chính (trước đây `startup install` đăng ký `ghitaprint.exe watch` nhưng subcommand
+  chưa tồn tại — autostart sẽ lỗi); `watch.exe` standalone giữ nguyên như wrapper mỏng.
+- **status.json được ghi ngay khi daemon ready** (trước đây chỉ ghi khi có lệnh in đầu tiên — `status`/watch
+  hiển thị dữ liệu cũ); `updated_at_ms` luôn được set.
+- **watch không replay job cũ** khi khởi động lại (baseline theo job mới nhất, không spam events.log);
+  **phát hiện daemon chết cả khi idle** (kiểm tra PID mỗi tick, trước đây chỉ kiểm tra khi status đổi);
+  bỏ qua kiểm tra liveness trên non-Windows.
+- Chống ghi đè chéo status.json giữa nhiều daemon (tmp file theo PID); toast Windows có throttle 3s;
+  events.log tự xoay khi > 5 MB; refactor `enforce_cross_site_policy` trả `Option<Response>`;
+  bỏ dead-code trong `read_connection`; xác minh `image::open` đã có giới hạn cấp phát mặc định 512 MiB
+  (chặn decompression bomb từ CLI, không cần đổi code).
+- 133 tests pass (129 lib + 4 setup), clippy 0 warning; installer build lại, SHA-256 mới
+  `AA0F563BDD446088B009E5F0577B7238F3B15A5948D7DE057ADFDECCBE693F91`.
+
+---
+
 ## [0.0.2] — 2026-11-07
 
 ### 🎉 Bản hoàn thiện cuối cùng của chu kỳ sản phẩm

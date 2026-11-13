@@ -11,18 +11,23 @@ use axum::{
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::discovery::DeviceScanner;
 use crate::encoder::PrintDocument;
+use crate::status::{self, JobSummary};
 use crate::transport::{PrinterTransport, TcpTransport, UsbTransport};
 
 pub const WS_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const WS_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const MAX_JOBS_IN_MEMORY: usize = 200;
+pub const MAX_PRINTER_LOCKS: usize = 256;
+pub const MAX_CONCURRENT_WS_PRINTS: usize = 8;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,15 +38,26 @@ pub struct AppState {
     pub diacritics: String,
     pub protocol: String,
     pub printer_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    pub jobs: Arc<Mutex<HashMap<u32, JobRecord>>>,
+    pub jobs: Arc<Mutex<VecDeque<JobRecord>>>,
+    pub last_error: Arc<Mutex<Option<JobRecord>>>,
+    pub prints_total: Arc<AtomicU64>,
+    pub prints_ok: Arc<AtomicU64>,
+    pub prints_failed: Arc<AtomicU64>,
+    pub ws_print_permits: Arc<Semaphore>,
     pub next_job_id: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JobRecord {
     pub id: u32,
-    pub state: String,
+    pub created_at_ms: u64,
+    pub source: String,
+    pub target: String,
+    pub mode: String,
+    pub success: bool,
+    pub code: String,
     pub message: String,
+    pub bytes_sent: usize,
 }
 
 impl AppState {
@@ -60,17 +76,34 @@ impl AppState {
             diacritics,
             protocol,
             printer_locks: Arc::new(Mutex::new(HashMap::new())),
-            jobs: Arc::new(Mutex::new(HashMap::new())),
+            jobs: Arc::new(Mutex::new(VecDeque::new())),
+            last_error: Arc::new(Mutex::new(None)),
+            prints_total: Arc::new(AtomicU64::new(0)),
+            prints_ok: Arc::new(AtomicU64::new(0)),
+            prints_failed: Arc::new(AtomicU64::new(0)),
+            ws_print_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_WS_PRINTS)),
             next_job_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
         }
     }
 
     pub async fn printer_lock(&self, target: &str) -> Arc<Mutex<()>> {
         let mut locks = self.printer_locks.lock().await;
+        if locks.len() >= MAX_PRINTER_LOCKS {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
         locks
             .entry(target.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    pub async fn release_printer_lock(&self, target: &str) {
+        let mut locks = self.printer_locks.lock().await;
+        if let Some(lock) = locks.get(target)
+            && Arc::strong_count(lock) == 1
+        {
+            locks.remove(target);
+        }
     }
 
     pub fn allocate_job_id(&self) -> u32 {
@@ -78,9 +111,105 @@ impl AppState {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub async fn record_job(&self, record: JobRecord) {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_print(
+        &self,
+        source: &str,
+        target: &str,
+        mode: &str,
+        success: bool,
+        code: &str,
+        message: &str,
+        bytes_sent: usize,
+    ) -> JobRecord {
+        let record = JobRecord {
+            id: self.allocate_job_id(),
+            created_at_ms: status::now_ms(),
+            source: source.to_string(),
+            target: target.to_string(),
+            mode: mode.to_string(),
+            success,
+            code: code.to_string(),
+            message: message.to_string(),
+            bytes_sent,
+        };
         let mut jobs = self.jobs.lock().await;
-        jobs.insert(record.id, record);
+        jobs.push_back(record.clone());
+        while jobs.len() > MAX_JOBS_IN_MEMORY {
+            jobs.pop_front();
+        }
+        drop(jobs);
+        if success {
+            self.prints_ok.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.prints_failed.fetch_add(1, Ordering::SeqCst);
+            *self.last_error.lock().await = Some(record.clone());
+        }
+        self.prints_total.fetch_add(1, Ordering::SeqCst);
+        self.publish_status().await;
+        record
+    }
+
+    async fn publish_status(&self) {
+        if !status::is_status_initialized() {
+            return;
+        }
+        let jobs_for_file: Vec<JobSummary> = {
+            let jobs = self.jobs.lock().await;
+            jobs.iter()
+                .rev()
+                .take(status::STATUS_JOBS_IN_FILE)
+                .map(|record| JobSummary {
+                    id: record.id,
+                    created_at_ms: record.created_at_ms,
+                    source: record.source.clone(),
+                    target: record.target.clone(),
+                    mode: record.mode.clone(),
+                    success: record.success,
+                    code: record.code.clone(),
+                    message: record.message.clone(),
+                    bytes_sent: record.bytes_sent as u64,
+                })
+                .collect()
+        };
+        let last_error_summary = self
+            .last_error
+            .lock()
+            .await
+            .clone()
+            .map(|record| job_record_to_summary(&record));
+        let snapshot = status::StatusSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: std::process::id(),
+            api_port: status::api_port(),
+            boot_started_at_ms: status::boot_started_ms(),
+            ready_at_ms: status::ready_at_ms(),
+            ready_after_ms: status::boot_to_ready_ms(),
+            prints_total: self.prints_total.load(Ordering::SeqCst),
+            prints_ok: self.prints_ok.load(Ordering::SeqCst),
+            prints_failed: self.prints_failed.load(Ordering::SeqCst),
+            last_error: last_error_summary,
+            jobs: jobs_for_file,
+            virtual_printer: status::current_virtual_printer_check(),
+            updated_at_ms: status::now_ms(),
+        };
+        if let Err(e) = status::write_status(&snapshot) {
+            tracing::warn!("Không thể cập nhật status.json: {}", e);
+        }
+    }
+}
+
+fn job_record_to_summary(record: &JobRecord) -> JobSummary {
+    JobSummary {
+        id: record.id,
+        created_at_ms: record.created_at_ms,
+        source: record.source.clone(),
+        target: record.target.clone(),
+        mode: record.mode.clone(),
+        success: record.success,
+        code: record.code.clone(),
+        message: record.message.clone(),
+        bytes_sent: record.bytes_sent as u64,
     }
 }
 
@@ -89,6 +218,7 @@ pub struct HealthResponse {
     pub status: String,
     pub version: String,
     pub uptime_seconds: u64,
+    pub ready_after_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -207,6 +337,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/printers", get(printers_handler))
         .route("/api/v1/print", post(print_handler))
         .route("/api/v1/print/raw", post(print_raw_handler))
+        .route("/api/v1/jobs", get(jobs_handler))
         .route("/printers/ghitaprint", post(ipp_handler))
         .route("/api/v1/ws", get(ws_handler))
         .fallback(api_fallback)
@@ -268,6 +399,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRespon
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: state.start_time.elapsed().as_secs(),
+        ready_after_ms: status::boot_to_ready_ms(),
     })
 }
 
@@ -304,6 +436,69 @@ fn unauthorized_response() -> Response {
         })),
     )
         .into_response()
+}
+
+fn browser_origin_host(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|origin| origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")))
+        .map(|host_port| {
+            let host = host_port
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(host_port);
+            host.trim_start_matches('[').trim_end_matches(']').to_string()
+        })
+}
+
+fn is_local_origin_host(host: &str) -> bool {
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+fn is_browser_request(headers: &HeaderMap) -> bool {
+    headers.get(axum::http::header::ORIGIN).is_some()
+        || headers
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            .is_some()
+}
+
+fn is_cross_site_browser(headers: &HeaderMap) -> bool {
+    if let Some(origin_host) = browser_origin_host(headers) {
+        return !is_local_origin_host(&origin_host);
+    }
+    headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .map(|site| site.eq_ignore_ascii_case("cross-site"))
+        .unwrap_or(false)
+}
+
+fn cross_site_blocked_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "success": false,
+            "code": "cross_site_blocked",
+            "message": "Yêu cầu đến từ website khác (cross-site) — bị chặn chống CSRF. Web POS cục bộ hãy dùng Origin localhost hoặc Authorization: Bearer <token>."
+        })),
+    )
+        .into_response()
+}
+
+fn enforce_cross_site_policy(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    if !is_cross_site_browser(headers) {
+        return None;
+    }
+    if state.api_token.is_empty() {
+        return Some(cross_site_blocked_response());
+    }
+    if is_authorized(state, headers) {
+        None
+    } else {
+        Some(unauthorized_response())
+    }
 }
 
 async fn printers_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -405,6 +600,9 @@ async fn print_handler(
     if !is_authorized(&state, &headers) {
         return unauthorized_response();
     }
+    if let Some(blocked) = enforce_cross_site_policy(&state, &headers) {
+        return blocked;
+    }
 
     let Json(req) = match payload {
         Ok(parsed) => parsed,
@@ -424,6 +622,9 @@ async fn print_handler(
     let (bytes, mode) = match prepare_print_payload(req.clone(), &state) {
         Ok(prepared) => prepared,
         Err(resp) => {
+            state
+                .record_print("rest", "", &resp.mode, false, &resp.code, &resp.message, 0)
+                .await;
             let status = if resp.code == "validation_error" {
                 StatusCode::UNPROCESSABLE_ENTITY
             } else {
@@ -433,7 +634,7 @@ async fn print_handler(
         }
     };
 
-    let outcome = execute_print(&state, req.target.as_deref(), &bytes, &mode).await;
+    let outcome = execute_print(&state, "rest", req.target.as_deref(), &bytes, &mode).await;
     let status = if outcome.success {
         StatusCode::OK
     } else if outcome.timed_out {
@@ -455,6 +656,9 @@ async fn print_raw_handler(
     if !is_authorized(&state, &headers) {
         return unauthorized_response();
     }
+    if let Some(blocked) = enforce_cross_site_policy(&state, &headers) {
+        return blocked;
+    }
 
     if body.is_empty() {
         return (
@@ -470,7 +674,7 @@ async fn print_raw_handler(
     }
 
     let target = query.target.as_deref();
-    let outcome = execute_print(&state, target, &body, "raw").await;
+    let outcome = execute_print(&state, "rest", target, &body, "raw").await;
     let status = if outcome.success {
         StatusCode::OK
     } else if outcome.timed_out {
@@ -488,7 +692,19 @@ struct RawTargetQuery {
     target: Option<String>,
 }
 
-async fn ipp_handler(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
+async fn ipp_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if is_browser_request(&headers) {
+        if state.api_token.is_empty() {
+            return cross_site_blocked_response();
+        }
+        if !is_authorized(&state, &headers) {
+            return unauthorized_response();
+        }
+    }
     let (response_bytes, log_line) = crate::server::ipp::handle_ipp_request(&state, &body).await;
     tracing::info!("{}", log_line);
     (
@@ -499,8 +715,24 @@ async fn ipp_handler(State(state): State<Arc<AppState>>, body: axum::body::Bytes
         .into_response()
 }
 
+async fn jobs_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized_response();
+    }
+    let jobs = state.jobs.lock().await;
+    let listed: Vec<JobRecord> = jobs.iter().rev().take(100).cloned().collect();
+    let total = state.prints_total.load(Ordering::SeqCst);
+    Json(serde_json::json!({
+        "jobs": listed,
+        "count": listed.len(),
+        "prints_total": total,
+    }))
+    .into_response()
+}
+
 pub async fn execute_print(
     state: &AppState,
+    source: &str,
     target_override: Option<&str>,
     raw_bytes: &[u8],
     mode: &str,
@@ -511,19 +743,23 @@ pub async fn execute_print(
         .to_string();
 
     if target.is_empty() {
-        return PrintResponse::failure(
+        let response = PrintResponse::failure(
             "validation_error",
             "Chưa cấu hình máy in mục tiêu (target hoặc default_printer)",
             "",
             mode,
         );
+        state
+            .record_print(source, "", mode, false, &response.code, &response.message, 0)
+            .await;
+        return response;
     }
 
     let len = raw_bytes.len();
     let lock = state.printer_lock(&target).await;
     let _guard = lock.lock().await;
 
-    if target.starts_with("usb://") {
+    let outcome = if target.starts_with("usb://") {
         let bytes = raw_bytes.to_vec();
         let target_for_task = target.clone();
         let opened =
@@ -537,7 +773,7 @@ pub async fn execute_print(
                         code: "ok".to_string(),
                         message: format!("Đã in thành công {} bytes qua USB Direct", len),
                         bytes_sent: len,
-                        used_target: target,
+                        used_target: target.clone(),
                         mode: mode.to_string(),
                         transport_failed: false,
                         timed_out: false,
@@ -571,7 +807,7 @@ pub async fn execute_print(
                     code: "ok".to_string(),
                     message: format!("Đã in thành công {} bytes qua TCP JetDirect", len),
                     bytes_sent: len,
-                    used_target: target,
+                    used_target: target.clone(),
                     mode: mode.to_string(),
                     transport_failed: false,
                     timed_out: false,
@@ -590,7 +826,34 @@ pub async fn execute_print(
                 matches!(e, crate::transport::TransportError::Timeout(_)),
             ),
         }
-    }
+    };
+
+    drop(_guard);
+    state.release_printer_lock(&target).await;
+
+    tracing::info!(
+        target = %outcome.used_target,
+        source = %source,
+        mode = %mode,
+        success = outcome.success,
+        bytes = outcome.bytes_sent,
+        "{}",
+        outcome.message
+    );
+
+    state
+        .record_print(
+            source,
+            &outcome.used_target,
+            mode,
+            outcome.success,
+            &outcome.code,
+            &outcome.message,
+            outcome.bytes_sent,
+        )
+        .await;
+
+    outcome
 }
 
 #[derive(Deserialize)]
@@ -751,10 +1014,29 @@ fn handle_ws_text(state: &AppState, text: &str, tx: &tokio::sync::mpsc::Unbounde
             };
             let state_clone = state.clone();
             let tx_clone = tx.clone();
+            let permit = match state_clone.ws_print_permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _ = tx.send(Message::Text(
+                        serde_json::json!({
+                            "event": "error",
+                            "code": "busy",
+                            "message": format!("Đang có quá nhiều lệnh in đồng thời (giới hạn {}), thử lại sau.", MAX_CONCURRENT_WS_PRINTS)
+                        })
+                        .to_string()
+                        .into(),
+                    ));
+                    return;
+                }
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 let (bytes, mode) = match prepare_print_payload(request, &state_clone) {
                     Ok(prepared) => prepared,
                     Err(resp) => {
+                        state_clone
+                            .record_print("ws", "", &resp.mode, false, &resp.code, &resp.message, 0)
+                            .await;
                         let _ = tx_clone.send(Message::Text(
                             serde_json::json!({
                                 "event": "print_result",
@@ -770,8 +1052,14 @@ fn handle_ws_text(state: &AppState, text: &str, tx: &tokio::sync::mpsc::Unbounde
                         return;
                     }
                 };
-                let outcome =
-                    execute_print(&state_clone, target_capture.as_deref(), &bytes, &mode).await;
+                let outcome = execute_print(
+                    &state_clone,
+                    "ws",
+                    target_capture.as_deref(),
+                    &bytes,
+                    &mode,
+                )
+                .await;
                 let _ = tx_clone.send(Message::Text(
                     serde_json::json!({
                         "event": "print_result",
@@ -1227,8 +1515,277 @@ mod tests {
     fn test_constant_time_eq_matches_std() {
         assert!(constant_time_eq("abc", "abc"));
         assert!(!constant_time_eq("abc", "abd"));
-        assert!(!constant_time_eq("abc", "abcd"));
+        assert!(!constant_time_eq("abcd", "abc"));
         assert!(!constant_time_eq("", "a"));
         assert!(constant_time_eq("", ""));
+    }
+
+    #[tokio::test]
+    async fn test_ipp_rejects_browser_origin_without_token() {
+        let app = create_router(test_state(""));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/printers/ghitaprint")
+                    .header("Origin", "http://evil.example.com")
+                    .body(Body::from(vec![1, 1, 0, 2, 0, 0, 0, 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_ipp_rejects_sec_fetch_browser_marker() {
+        let app = create_router(test_state(""));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/printers/ghitaprint")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .body(Body::from(vec![1, 1, 0, 2, 0, 0, 0, 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_ipp_allows_non_browser_client_without_token() {
+        let app = create_router(test_state(""));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/printers/ghitaprint")
+                    .body(Body::from(vec![1, 1, 0, 2, 0, 0, 0, 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_ipp_allows_browser_with_valid_token() {
+        let app = create_router(test_state("secret123"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/printers/ghitaprint")
+                    .header("Origin", "http://evil.example.com")
+                    .header("Authorization", "Bearer secret123")
+                    .body(Body::from(vec![1, 1, 0, 2, 0, 0, 0, 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_print_cross_site_origin_blocked_without_token() {
+        let app = create_router(test_state(""));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/print")
+                    .header("Content-Type", "application/json")
+                    .header("Origin", "http://evil.example.com")
+                    .body(print_request_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "cross_site_blocked");
+    }
+
+    #[tokio::test]
+    async fn test_print_cross_site_origin_with_wrong_token_unauthorized() {
+        let app = create_router(test_state("secret123"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/print")
+                    .header("Content-Type", "application/json")
+                    .header("Origin", "http://evil.example.com")
+                    .body(print_request_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_print_cross_site_origin_with_valid_token_ok() {
+        let app = create_router(test_state("secret123"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/print")
+                    .header("Content-Type", "application/json")
+                    .header("Origin", "http://evil.example.com")
+                    .header("Authorization", "Bearer secret123")
+                    .body(print_request_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_print_localhost_origin_allowed_without_token() {
+        let app = create_router(test_state(""));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/print")
+                    .header("Content-Type", "application/json")
+                    .header("Origin", "http://localhost:3000")
+                    .body(print_request_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "validation_error");
+    }
+
+    #[tokio::test]
+    async fn test_jobs_endpoint_requires_token_when_configured() {
+        let app = create_router(test_state("secret123"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_jobs_endpoint_lists_recorded_prints() {
+        let state = test_state("");
+        state
+            .record_print(
+                "rest", "127.0.0.1:9100", "raw", true, "ok", "In thành công", 42,
+            )
+            .await;
+        state
+            .record_print(
+                "ws", "127.0.0.1:9101", "document", false, "transport_error", "Không thể kết nối", 0,
+            )
+            .await;
+        let app = create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["count"], 2);
+        assert_eq!(json["jobs"][0]["code"], "transport_error");
+        assert_eq!(json["jobs"][1]["code"], "ok");
+        assert_eq!(json["prints_total"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_record_print_ring_buffer_caps_at_limit() {
+        let state = test_state("");
+        for index in 0..(MAX_JOBS_IN_MEMORY + 50) {
+            state
+                .record_print(
+                    "rest",
+                    "127.0.0.1:9100",
+                    "raw",
+                    true,
+                    "ok",
+                    "In thành công",
+                    index,
+                )
+                .await;
+        }
+        let jobs = state.jobs.lock().await;
+        assert_eq!(jobs.len(), MAX_JOBS_IN_MEMORY);
+        assert_eq!(jobs.back().unwrap().id, MAX_JOBS_IN_MEMORY as u32 + 50);
+        assert_eq!(state.prints_total.load(Ordering::SeqCst), (MAX_JOBS_IN_MEMORY + 50) as u64);
+    }
+
+    #[tokio::test]
+    async fn test_printer_lock_released_after_use() {
+        let state = test_state("");
+        let lock = state.printer_lock("usb://0416:5011").await;
+        assert!(state.printer_locks.lock().await.contains_key("usb://0416:5011"));
+        drop(lock);
+        state.release_printer_lock("usb://0416:5011").await;
+        assert!(!state.printer_locks.lock().await.contains_key("usb://0416:5011"));
+    }
+
+    #[test]
+    fn test_cross_site_detection() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://evil.example.com"),
+        );
+        assert!(is_cross_site_browser(&headers));
+        assert!(is_browser_request(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://localhost:3000"),
+        );
+        assert!(!is_cross_site_browser(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:5500"),
+        );
+        assert!(!is_cross_site_browser(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "sec-fetch-site",
+            HeaderValue::from_static("cross-site"),
+        );
+        assert!(is_cross_site_browser(&headers));
+
+        let headers = HeaderMap::new();
+        assert!(!is_browser_request(&headers));
+        assert!(!is_cross_site_browser(&headers));
     }
 }

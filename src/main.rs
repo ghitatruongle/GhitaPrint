@@ -23,6 +23,7 @@ const EXIT_DAEMON_ERROR: u8 = 4;
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Cli::parse();
+    ghitaprint::status::mark_boot_started();
 
     let config_mgr = match &args.config_path {
         Some(path) => ConfigManager::with_path(path.clone()),
@@ -30,10 +31,22 @@ async fn main() -> ExitCode {
     };
     let settings = config_mgr.load();
 
+    let is_daemon_run = matches!(
+        &args.command,
+        Commands::Daemon(daemon_args) if daemon_args.start || daemon_args.restart
+    );
     let is_daemon_foreground = matches!(
         &args.command,
         Commands::Daemon(daemon_args) if (daemon_args.start || daemon_args.restart) && !daemon_args.hidden
     );
+
+    if is_daemon_run && config_mgr.is_cwd_override() {
+        print_error(
+            "Phát hiện ghitaprint.toml trong thư mục hiện tại đang đè lên cấu hình hệ thống (%APPDATA%\\GhitaPrint). \
+             Daemon từ chối khởi động để tránh chạy sai cấu hình — xóa/dời file này hoặc dùng --config-path.",
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
 
     init_tracing(
         args.log_level.as_deref().unwrap_or(&settings.log_level),
@@ -60,6 +73,10 @@ async fn main() -> ExitCode {
         }
         Commands::Daemon(daemon_args) => run_daemon(&daemon_args, &settings, args.json).await,
         Commands::Status => run_status(&settings, args.json).await,
+        Commands::Watch(watch_args) => {
+            ghitaprint::watch::run_watch(watch_args.interval_ms, watch_args.no_toast, watch_args.once);
+            ExitCode::from(EXIT_OK)
+        }
     }
 }
 
@@ -72,7 +89,8 @@ fn init_tracing(level: &str, to_file: bool) {
             .with_ansi(!to_file),
     );
     if to_file && let Some(dir) = log_dir() {
-        let appender = tracing_appender::rolling::daily(dir, "ghitaprint.log");
+        cleanup_old_logs(&dir);
+        let appender = tracing_appender::rolling::daily(&dir, "ghitaprint.log");
         subscriber
             .with(
                 tracing_subscriber::fmt::layer()
@@ -98,6 +116,7 @@ fn install_panic_hook() {
     };
     let crash_path = dir.join("crash.log");
     std::panic::set_hook(Box::new(move |info| {
+        ghitaprint::server::remove_pid_file();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -113,6 +132,39 @@ fn install_panic_hook() {
             .open(&crash_path)
             .and_then(|mut file| writeln!(file, "{}", entry));
     }));
+}
+
+const LOG_RETENTION_DAYS: u64 = 7;
+const CRASH_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+fn cleanup_old_logs(dir: &Path) {
+    let retention = std::time::Duration::from_secs(LOG_RETENTION_DAYS * 24 * 60 * 60);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if !name.starts_with("ghitaprint.log.") {
+                continue;
+            }
+            let stale = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .map(|age| age > retention)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    let crash_log = dir.join("crash.log");
+    if let Ok(meta) = std::fs::metadata(&crash_log)
+        && meta.len() > CRASH_LOG_MAX_BYTES
+    {
+        let _ = std::fs::rename(&crash_log, dir.join("crash.log.old"));
+    }
 }
 
 fn emit_json(value: &serde_json::Value) {
@@ -508,10 +560,11 @@ async fn run_daemon(
                 emit_json(&json_result(true, "ok", "Daemon nền đã khởi chạy ẩn"));
             } else {
                 print_success("Daemon nền đã được khởi chạy ẩn (không cửa sổ console).");
+                print_info("Xác nhận trạng thái bằng: ghitaprint status");
             }
             return ExitCode::from(EXIT_OK);
         }
-        print_error("Không thể khởi chạy daemon nền ẩn (không thấy health OK sau khi spawn).");
+        print_error("Không thể khởi chạy daemon nền ẩn (CreateProcessW thất bại).");
         return ExitCode::from(EXIT_DAEMON_ERROR);
     }
 
@@ -549,49 +602,87 @@ async fn run_startup(action: StartupAction, json: bool) -> ExitCode {
             if !json {
                 print_info("Đang đăng ký GhitaPrint vào Windows Registry Run (HKCU)...");
             }
-            match ghitaprint::os::install_startup() {
-                Ok(cmd) => {
+            let daemon_result = ghitaprint::os::install_startup();
+            let watch_result = ghitaprint::os::install_watch_startup();
+            match (daemon_result, watch_result) {
+                (Ok(daemon_cmd), Ok(watch_cmd)) => {
                     if json {
-                        emit_json(&json_result(true, "ok", &cmd));
+                        emit_json(&serde_json::json!({
+                            "daemon": daemon_cmd,
+                            "watch": watch_cmd
+                        }));
                     } else {
                         print_success("Đã kích hoạt tự khởi động ẩn cùng Windows thành công!");
-                        println!("  Lệnh đăng ký: {}", cmd);
+                        println!("  Daemon : {}", daemon_cmd);
+                        println!("  Watch  : {}", watch_cmd);
                     }
                     ExitCode::from(EXIT_OK)
                 }
-                Err(e) => {
-                    print_error(&format!("Lỗi khi đăng ký khởi động: {}", e));
+                (daemon_result, watch_result) => {
+                    if let Err(e) = &daemon_result {
+                        print_error(&format!("Lỗi khi đăng ký khởi động daemon: {}", e));
+                    }
+                    if let Err(e) = &watch_result {
+                        print_error(&format!("Lỗi khi đăng ký khởi động watch: {}", e));
+                    }
                     ExitCode::from(EXIT_GENERAL_ERROR)
                 }
             }
         }
-        StartupAction::Uninstall => match ghitaprint::os::uninstall_startup() {
-            Ok(()) => {
+        StartupAction::Uninstall => {
+            let daemon_result = ghitaprint::os::uninstall_startup();
+            let watch_result = ghitaprint::os::uninstall_watch_startup();
+            let all_ok = daemon_result.is_ok() && watch_result.is_ok();
+            if all_ok {
                 if json {
                     emit_json(&json_result(true, "ok", "Đã hủy tự khởi động"));
                 } else {
-                    print_success("Đã hủy tự khởi động cùng Windows!");
+                    print_success("Đã hủy tự khởi động cùng Windows (daemon + watch)!");
                 }
                 ExitCode::from(EXIT_OK)
-            }
-            Err(e) => {
-                print_error(&format!("Lỗi khi gỡ đăng ký: {}", e));
+            } else {
+                if let Err(e) = &daemon_result {
+                    print_error(&format!("Lỗi khi gỡ đăng ký daemon: {}", e));
+                }
+                if let Err(e) = &watch_result {
+                    print_error(&format!("Lỗi khi gỡ đăng ký watch: {}", e));
+                }
                 ExitCode::from(EXIT_GENERAL_ERROR)
             }
-        },
+        }
         StartupAction::Status => {
             let is_enabled = ghitaprint::os::is_startup_enabled();
+            let is_watch = ghitaprint::os::is_watch_startup_enabled();
             if json {
-                emit_json(&serde_json::json!({ "enabled": is_enabled }));
+                emit_json(&serde_json::json!({
+                    "enabled": is_enabled,
+                    "watch_enabled": is_watch
+                }));
             } else {
                 print_info("Trạng thái tự khởi động cùng Windows:");
-                if is_enabled {
-                    println!("  • Registry Run (HKCU): Đã kích hoạt [✔]");
-                    if let Some(cmd) = ghitaprint::os::get_startup_command() {
-                        println!("  • Lệnh thực thi      : {}", cmd);
+                println!(
+                    "  • Registry Run Daemon: {}",
+                    if is_enabled {
+                        "Đã kích hoạt [✔]"
+                    } else {
+                        "Chưa kích hoạt"
                     }
-                } else {
-                    println!("  • Registry Run (HKCU): Chưa kích hoạt [Chưa bật]");
+                );
+                println!(
+                    "  • Registry Run Watch : {}",
+                    if is_watch {
+                        "Đã kích hoạt [✔]"
+                    } else {
+                        "Chưa kích hoạt"
+                    }
+                );
+                if let Some(cmd) = ghitaprint::os::get_startup_command() {
+                    println!("  • Lệnh daemon        : {}", cmd);
+                }
+                if let Some(cmd) = ghitaprint::os::get_watch_startup_command() {
+                    println!("  • Lệnh watch         : {}", cmd);
+                }
+                if !is_enabled {
                     println!("  • Để kích hoạt, chạy : ghitaprint startup install");
                 }
             }
@@ -690,13 +781,8 @@ async fn run_daemon_foreground(port: u16, settings: &Settings, json: bool) -> Ex
         port
     );
 
-    if port == settings.api_port {
-        match server::ensure_virtual_printer_matches(port) {
-            Ok(Some(note)) => print_warning(&note),
-            Ok(None) => {}
-            Err(e) => print_warning(&e),
-        }
-    } else {
+    let check_virtual_printer = port == settings.api_port;
+    if !check_virtual_printer {
         tracing::info!(
             "Daemon chạy trên cổng tạm {} (khác cổng cấu hình {}) — bỏ qua kiểm tra máy in ảo",
             port,
@@ -711,15 +797,16 @@ async fn run_daemon_foreground(port: u16, settings: &Settings, json: bool) -> Ex
         ));
     }
 
-    let result = server::start_server(
+    let result = server::start_server(server::DaemonServerConfig {
         port,
-        settings.default_printer.clone(),
-        settings.connection_timeout_secs,
-        settings.api_token.clone(),
-        settings.diacritics.clone(),
-        settings.protocol.clone(),
-        json,
-    )
+        default_printer: settings.default_printer.clone(),
+        timeout_secs: settings.connection_timeout_secs,
+        api_token: settings.api_token.clone(),
+        diacritics: settings.diacritics.clone(),
+        protocol: settings.protocol.clone(),
+        json_mode: json,
+        check_virtual_printer,
+    })
     .await;
 
     match result {
@@ -756,7 +843,17 @@ async fn wait_port_released(port: u16) {
 
 async fn run_status(settings: &Settings, json: bool) -> ExitCode {
     let is_startup = ghitaprint::os::is_startup_enabled();
-    let daemon_version = server::probe_health(settings.api_port, 1).await;
+    let is_watch = ghitaprint::os::is_watch_startup_enabled();
+    let snapshot = ghitaprint::status::load_status();
+    let snapshot_live = snapshot
+        .as_ref()
+        .map(|snap| server::is_live_ghitaprint_pid(snap.pid))
+        .unwrap_or(false);
+    let daemon_version = if snapshot_live {
+        snapshot.as_ref().map(|snap| snap.version.clone())
+    } else {
+        server::probe_health(settings.api_port, 1).await
+    };
     let daemon_alive = daemon_version.is_some();
 
     if json {
@@ -764,8 +861,18 @@ async fn run_status(settings: &Settings, json: bool) -> ExitCode {
             "daemon_running": daemon_alive,
             "daemon_version": daemon_version,
             "startup_enabled": is_startup,
+            "watch_enabled": is_watch,
             "default_printer": settings.default_printer,
-            "api_port": settings.api_port
+            "api_port": settings.api_port,
+            "snapshot": snapshot.as_ref().map(|snap| serde_json::json!({
+                "pid": snap.pid,
+                "ready_after_ms": snap.ready_after_ms,
+                "prints_total": snap.prints_total,
+                "prints_ok": snap.prints_ok,
+                "prints_failed": snap.prints_failed,
+                "last_error": snap.last_error,
+                "jobs": snap.jobs,
+            }))
         }));
         return ExitCode::from(EXIT_OK);
     }
@@ -778,12 +885,46 @@ async fn run_status(settings: &Settings, json: bool) -> ExitCode {
             None => "Không chạy".to_string(),
         }
     );
+    if let (true, Some(snap)) = (snapshot_live, snapshot.as_ref()) {
+        if let Some(ready_after) = snap.ready_after_ms {
+            println!("  • Khởi động boot→ready: {} ms", ready_after);
+        }
+        println!(
+            "  • Thống kê in         : tổng {} (OK {}, lỗi {})",
+            snap.prints_total, snap.prints_ok, snap.prints_failed
+        );
+        if let Some(error) = &snap.last_error {
+            println!(
+                "  • Lỗi gần nhất        : {} — {} ({})",
+                error.target, error.message, error.source
+            );
+        }
+        for job in snap.jobs.iter().take(5) {
+            println!(
+                "    {} #{} {} {} bytes → {} ({})",
+                if job.success { "✔" } else { "✖" },
+                job.id,
+                if job.success { "OK" } else { "LỖI" },
+                job.bytes_sent,
+                if job.target.is_empty() { "(không target)" } else { &job.target },
+                job.source
+            );
+        }
+    }
     println!(
         "  • Tự khởi động Windows: {}",
         if is_startup {
             "Đã bật [✔]"
         } else {
             "Chưa bật"
+        }
+    );
+    println!(
+        "  • Watch companion     : {}",
+        if is_watch {
+            "Đã bật [✔] (ghitaprint watch)"
+        } else {
+            "Chưa bật (ghitaprint startup install để bật kèm daemon)"
         }
     );
     println!(
@@ -830,21 +971,12 @@ async fn send_to_printer(target_addr: &str, data: &[u8], timeout_secs: u64) -> R
 }
 
 #[cfg(windows)]
-fn spawn_hidden_daemon(settings: &Settings) -> bool {
+fn spawn_hidden_daemon(_settings: &Settings) -> bool {
     let Ok(exe_path) = std::env::current_exe() else {
         return false;
     };
-    let probe_port = settings.api_port;
 
-    match ghitaprint::os::process::spawn_detached(&exe_path, &["daemon", "--start"]) {
-        Ok(_) => match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle
-                .block_on(server::probe_health(probe_port, 10))
-                .is_some(),
-            Err(_) => ghitaprint::os::process::probe_health_sync(probe_port, 6).is_some(),
-        },
-        Err(_) => false,
-    }
+    ghitaprint::os::process::spawn_detached(&exe_path, &["daemon", "--start"]).is_ok()
 }
 
 #[cfg(not(windows))]
@@ -855,12 +987,23 @@ fn spawn_hidden_daemon(_settings: &Settings) -> bool {
 #[cfg(windows)]
 fn stop_running_daemon() -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_TERMINATE, OpenProcess, TerminateProcess,
+    };
 
     let self_pid = std::process::id();
     let Some(pid) = server::read_daemon_pid().filter(|candidate| *candidate != self_pid) else {
         return false;
     };
+
+    if !server::is_live_ghitaprint_pid(pid) {
+        tracing::warn!(
+            "PID {} trong daemon.pid không còn là tiến trình ghitaprint (PID-reuse?) — bỏ qua kill, chỉ dọn file",
+            pid
+        );
+        server::remove_pid_file();
+        return false;
+    }
 
     let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
     if handle.is_null() {

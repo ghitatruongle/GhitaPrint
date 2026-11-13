@@ -62,6 +62,29 @@ pub enum Commands {
 
     #[command(about = "Kiểm tra trạng thái hoạt động của daemon và máy in")]
     Status,
+
+    #[command(about = "Companion theo dõi sự kiện in: ghi events.log + toast Windows khi in lỗi")]
+    Watch(WatchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct WatchArgs {
+    #[arg(
+        long,
+        default_value_t = 500,
+        help = "Chu kỳ quét status.json (mili giây, tối thiểu 100)"
+    )]
+    pub interval_ms: u64,
+
+    #[arg(long, help = "Tắt toast Windows — chỉ ghi events.log")]
+    pub no_toast: bool,
+
+    #[arg(
+        long,
+        hide = true,
+        help = "Ghi sự kiện hiện có rồi thoát (dùng cho kiểm thử)"
+    )]
+    pub once: bool,
 }
 
 #[derive(Args, Debug)]

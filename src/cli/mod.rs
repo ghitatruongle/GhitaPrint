@@ -4,5 +4,5 @@ pub mod output;
 #[allow(unused_imports)]
 pub use commands::{
     Cli, Commands, ConfigAction, DaemonArgs, PrintArgs, ScanArgs, StartupAction, TestArgs,
-    VirtualPrinterAction, VirtualPrinterArgs,
+    VirtualPrinterAction, VirtualPrinterArgs, WatchArgs,
 };
