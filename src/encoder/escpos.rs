@@ -302,12 +302,16 @@ fn encode_text_bytes(text: &str, mode: &str) -> (Option<u8>, Vec<u8>) {
         "raw" => (None, sanitize_to_bytes(text)),
         "keep" => {
             if text.is_ascii() {
-                return (None, text.as_bytes().to_vec());
+                return (None, sanitize_to_bytes(text));
             }
             let mut bytes = Vec::with_capacity(text.len());
             let mut all_mapped = true;
             for ch in text.chars() {
                 if ch.is_ascii() {
+                    if ch.is_control() {
+                        all_mapped = false;
+                        break;
+                    }
                     bytes.push(ch as u8);
                 } else if let Some(b) = tcvn3_byte(ch) {
                     bytes.push(b);
@@ -319,10 +323,10 @@ fn encode_text_bytes(text: &str, mode: &str) -> (Option<u8>, Vec<u8>) {
             if all_mapped {
                 (Some(ESC_T_CODEPAGE_VIETNAMESE_TCVN3), bytes)
             } else {
-                (None, strip_diacritics(text).into_bytes())
+                (None, sanitize_to_bytes(&strip_diacritics(text)))
             }
         }
-        _ => (None, strip_diacritics(text).into_bytes()),
+        _ => (None, sanitize_to_bytes(&strip_diacritics(text))),
     }
 }
 
@@ -428,6 +432,17 @@ mod tests {
         b.text("a\u{1b}b\u{7}c\u{0}d");
         let bytes = b.into_bytes();
         assert!(bytes.ends_with(b"abcd"));
+    }
+
+    #[test]
+    fn test_text_vi_filters_control_chars_in_all_modes() {
+        for mode in ["auto", "strip", "keep", "raw"] {
+            let mut b = EscPosBuilder::new();
+            b.text_vi("a\u{1b}b\u{7}c", mode);
+            let bytes = b.into_bytes();
+            let payload = bytes.strip_prefix(&[0x1B, 0x40]).unwrap_or(&bytes);
+            assert_eq!(payload, b"abc", "mode {} phải lọc control", mode);
+        }
     }
 
     #[test]

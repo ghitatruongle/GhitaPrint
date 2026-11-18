@@ -94,10 +94,9 @@ fn inflate_bytes(raw: &[u8]) -> Result<Vec<u8>, String> {
             "PWG: dữ liệu giải nén vượt giới hạn {} MB — nghi ngờ zlib bomb, đã chặn",
             MAX_INFLATED_BYTES / (1024 * 1024)
         )),
-        Err(InflateFailure::Corrupt(e)) => Err(format!(
-            "Không thể giải nén dữ liệu PWG (flate): {}",
-            e
-        )),
+        Err(InflateFailure::Corrupt(e)) => {
+            Err(format!("Không thể giải nén dữ liệu PWG (flate): {}", e))
+        }
     }
 }
 
@@ -140,10 +139,6 @@ pub fn decode_pwg_document(data: &[u8], compression: Option<&str>) -> Result<Vec
         }
 
         let image_data_size = read_u32_be(data, offset + 36).unwrap_or(0) as usize;
-        let expected_raw = (width as usize)
-            .saturating_mul(height as usize)
-            .saturating_mul(channels as usize)
-            .saturating_mul((bits_per_channel.max(1)) as usize / 8.max(bits_per_channel as usize));
 
         let raw_start = offset + HEADER_SIZE;
         let raw_end = (raw_start + image_data_size).min(data.len());
@@ -181,7 +176,7 @@ pub fn decode_pwg_document(data: &[u8], compression: Option<&str>) -> Result<Vec
             let row = &payload[y * row_stride..(y + 1) * row_stride];
             if is_one_bit {
                 for x in 0..width as usize {
-                    let byte = row.get(x/8).copied().unwrap_or(0xFF);
+                    let byte = row.get(x / 8).copied().unwrap_or(0xFF);
                     let bit_set = (byte >> (7 - (x % 8))) & 1 == 1;
                     let value = if bit_set { 0u8 } else { 255u8 };
                     rgba.extend_from_slice(&[value, value, value, 255]);
@@ -215,7 +210,6 @@ pub fn decode_pwg_document(data: &[u8], compression: Option<&str>) -> Result<Vec
         if flate_requested {
             break;
         }
-        let _ = expected_raw;
         if color_space == 0 {
             break;
         }

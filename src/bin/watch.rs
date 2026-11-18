@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use clap::Parser;
 use ghitaprint::cli::WatchArgs;
 
@@ -14,6 +16,11 @@ struct WatchCli {
 
 fn main() -> std::process::ExitCode {
     let cli = WatchCli::parse();
-    ghitaprint::watch::run_watch(cli.args.interval_ms, cli.args.no_toast, cli.args.once);
+    ghitaprint::watch::run_watch_with_hidden(
+        cli.args.interval_ms,
+        cli.args.no_toast,
+        cli.args.once,
+        cli.args.hidden,
+    );
     std::process::ExitCode::SUCCESS
 }

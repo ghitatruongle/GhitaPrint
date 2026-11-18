@@ -41,6 +41,10 @@ pub struct StatusSnapshot {
     pub last_error: Option<JobSummary>,
     pub jobs: Vec<JobSummary>,
     pub virtual_printer: Option<VirtualPrinterCheck>,
+    #[serde(default)]
+    pub config_warning: Option<String>,
+    #[serde(default)]
+    pub raw_port_ok: Option<bool>,
     pub updated_at_ms: u64,
 }
 
@@ -50,6 +54,8 @@ static API_PORT: AtomicU16 = AtomicU16::new(0);
 static STATUS_PATH: OnceLock<PathBuf> = OnceLock::new();
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 static VP_CHECK: Mutex<Option<VirtualPrinterCheck>> = Mutex::new(Option::None);
+static CONFIG_WARNING: Mutex<Option<String>> = Mutex::new(None);
+static RAW_PORT_OK: Mutex<Option<bool>> = Mutex::new(None);
 
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -59,7 +65,9 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn mark_boot_started() {
-    BOOT_STARTED_MS.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst).ok();
+    BOOT_STARTED_MS
+        .compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst)
+        .ok();
 }
 
 pub fn boot_started_ms() -> u64 {
@@ -67,7 +75,9 @@ pub fn boot_started_ms() -> u64 {
 }
 
 pub fn mark_ready() {
-    READY_AT_MS.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst).ok();
+    READY_AT_MS
+        .compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst)
+        .ok();
 }
 
 pub fn ready_at_ms() -> Option<u64> {
@@ -121,10 +131,32 @@ pub fn current_virtual_printer_check() -> Option<VirtualPrinterCheck> {
     VP_CHECK.lock().ok().and_then(|slot| slot.clone())
 }
 
+pub fn set_config_warning(message: Option<String>) {
+    if let Ok(mut slot) = CONFIG_WARNING.lock() {
+        *slot = message;
+    }
+}
+
+pub fn current_config_warning() -> Option<String> {
+    CONFIG_WARNING.lock().ok().and_then(|slot| slot.clone())
+}
+
+pub fn set_raw_port_ok(ok: bool) {
+    if let Ok(mut slot) = RAW_PORT_OK.lock() {
+        *slot = Some(ok);
+    }
+}
+
+pub fn current_raw_port_ok() -> Option<bool> {
+    RAW_PORT_OK.lock().ok().and_then(|slot| *slot)
+}
+
 fn write_status_to_impl(path: &Path, snapshot: &StatusSnapshot) -> Result<(), String> {
     let tmp_path = path.with_file_name(format!(
         "{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("status"),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("status"),
         std::process::id()
     ));
     let payload = serde_json::to_string_pretty(snapshot)
@@ -137,7 +169,9 @@ fn write_status_to_impl(path: &Path, snapshot: &StatusSnapshot) -> Result<(), St
 }
 
 pub fn write_status_to(path: &Path, snapshot: &StatusSnapshot) -> Result<(), String> {
-    let guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let result = write_status_to_impl(path, snapshot);
     drop(guard);
     result
@@ -169,7 +203,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("status.json");
         let snapshot = StatusSnapshot {
-            version: "0.0.3-preview".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             pid: 1234,
             api_port: 9123,
             boot_started_at_ms: 1000,
@@ -195,18 +229,26 @@ mod tests {
                 raw_port: 9124,
                 checked_at_ms: 999,
             }),
+            config_warning: Some("cấu hình hỏng".to_string()),
+            raw_port_ok: Some(false),
             updated_at_ms: 4321,
         };
         let written = write_status_to(&path, &snapshot);
-        assert!(written.is_ok(), "ghi status phải thành công: {:?}", written.err());
+        assert!(
+            written.is_ok(),
+            "ghi status phải thành công: {:?}",
+            written.err()
+        );
         let loaded = load_status_from(&path).expect("status.json phải đọc lại được");
-        assert_eq!(loaded.version, "0.0.3-preview");
+        assert_eq!(loaded.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(loaded.pid, 1234);
         assert_eq!(loaded.api_port, 9123);
         assert_eq!(loaded.ready_after_ms, Some(250));
         assert_eq!(loaded.prints_failed, 2);
         assert_eq!(loaded.last_error.unwrap().id, 9);
         assert!(loaded.virtual_printer.unwrap().port_ok);
+        assert_eq!(loaded.config_warning.as_deref(), Some("cấu hình hỏng"));
+        assert_eq!(loaded.raw_port_ok, Some(false));
         assert_eq!(loaded.updated_at_ms, 4321);
         assert!(!dir.path().join("status.json.tmp").exists());
         let _ = std::fs::remove_file(path);

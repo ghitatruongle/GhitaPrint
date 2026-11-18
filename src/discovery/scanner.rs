@@ -72,6 +72,15 @@ impl DeviceScanner {
         Some((ip, prefix))
     }
 
+    pub fn subnet_network_address(ip: Ipv4Addr, prefix: u32) -> u32 {
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        };
+        u32::from(ip) & mask
+    }
+
     pub async fn scan_subnet(
         cidr: &str,
         port: u16,
@@ -88,21 +97,18 @@ impl DeviceScanner {
             ));
         }
 
-        let base: u32 = base_ip.into();
+        let network = Self::subnet_network_address(base_ip, prefix);
         let timeout_secs = (timeout_ms / 1000).max(1);
         let mut set = tokio::task::JoinSet::new();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(128));
 
         for offset in 0..total_hosts {
-            let ip_int = base.wrapping_add(offset as u32);
-            let ip = Ipv4Addr::from(ip_int);
-            let octets = ip.octets();
             let is_network = offset == 0;
             let is_broadcast = offset + 1 == total_hosts;
-            let is_special = octets[3] == 0 || octets[3] == 255;
-            if (total_hosts > 2 && (is_network || is_broadcast)) || is_special {
+            if total_hosts > 2 && (is_network || is_broadcast) {
                 continue;
             }
+            let ip = Ipv4Addr::from(network.wrapping_add(offset as u32));
 
             let permit = semaphore.clone();
             let target = format!("{}:{}", ip, port);
@@ -156,6 +162,22 @@ use std::sync::Arc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_subnet_network_address_masks_unaligned_hosts() {
+        assert_eq!(
+            DeviceScanner::subnet_network_address(Ipv4Addr::new(192, 168, 1, 100), 24),
+            u32::from(Ipv4Addr::new(192, 168, 1, 0))
+        );
+        assert_eq!(
+            DeviceScanner::subnet_network_address(Ipv4Addr::new(10, 0, 5, 0), 16),
+            u32::from(Ipv4Addr::new(10, 0, 0, 0))
+        );
+        assert_eq!(
+            DeviceScanner::subnet_network_address(Ipv4Addr::new(10, 0, 0, 5), 30),
+            u32::from(Ipv4Addr::new(10, 0, 0, 4))
+        );
+    }
 
     #[test]
     fn test_parse_cidr_valid_and_invalid() {

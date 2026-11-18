@@ -82,6 +82,13 @@ pub struct WatchArgs {
     #[arg(
         long,
         hide = true,
+        help = "Bootstrap ẩn dùng bởi Registry Run/Setup: re-exec watch detached không cửa sổ"
+    )]
+    pub hidden: bool,
+
+    #[arg(
+        long,
+        hide = true,
         help = "Ghi sự kiện hiện có rồi thoát (dùng cho kiểm thử)"
     )]
     pub once: bool,
@@ -221,6 +228,12 @@ pub enum StartupAction {
 }
 
 #[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("daemon_action")
+        .required(true)
+        .multiple(false)
+        .args(["start", "stop", "restart"]),
+))]
 pub struct DaemonArgs {
     #[arg(long, help = "Khởi chạy daemon chạy ngầm")]
     pub start: bool,

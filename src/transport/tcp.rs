@@ -15,8 +15,17 @@ pub struct TcpTransport {
 impl TcpTransport {
     pub fn normalize_address(addr: &str) -> String {
         let bare = addr.strip_prefix("tcp://").unwrap_or(addr);
-        if bare.contains(':') {
+        let has_port = if let Some(rest) = bare.strip_prefix('[') {
+            rest.split_once(']')
+                .map(|(_, suffix)| suffix.starts_with(':'))
+                .unwrap_or(false)
+        } else {
+            bare.matches(':').count() == 1
+        };
+        if has_port {
             bare.to_string()
+        } else if bare.contains(':') {
+            format!("[{}]:9100", bare)
         } else {
             format!("{}:9100", bare)
         }
@@ -99,6 +108,9 @@ mod tests {
             TcpTransport::normalize_address("tcp://192.168.1.100"),
             "192.168.1.100:9100"
         );
+        assert_eq!(TcpTransport::normalize_address("::1"), "[::1]:9100");
+        assert_eq!(TcpTransport::normalize_address("[::1]:9100"), "[::1]:9100");
+        assert_eq!(TcpTransport::normalize_address("fe80::1"), "[fe80::1]:9100");
     }
 
     #[tokio::test]

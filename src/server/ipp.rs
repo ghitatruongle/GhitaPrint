@@ -66,6 +66,22 @@ impl IppRequest {
         }
         None
     }
+
+    pub fn integer_value(&self, name: &str) -> Option<i32> {
+        for (_, attrs) in &self.groups {
+            for attr in attrs {
+                if attr.name == name && attr.value.len() >= 4 {
+                    return Some(i32::from_be_bytes([
+                        attr.value[0],
+                        attr.value[1],
+                        attr.value[2],
+                        attr.value[3],
+                    ]));
+                }
+            }
+        }
+        None
+    }
 }
 
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
@@ -306,16 +322,31 @@ pub fn build_response(
 }
 
 fn page_to_dynamic_image(page: &pwg::PwgPage) -> Result<DynamicImage, String> {
-    image::RgbImage::from_raw(page.width, page.height, page.rgba.clone())
-        .map(DynamicImage::ImageRgb8)
-        .ok_or_else(|| {
-            format!(
-                "PWG: kích thước trang {}x{} không khớp buffer {} bytes",
-                page.width,
-                page.height,
-                page.rgba.len()
-            )
-        })
+    if page.height > u16::MAX as u32 || page.width.div_ceil(8) > u16::MAX as u32 {
+        return Err(format!(
+            "PWG: trang {}x{} vượt giới hạn raster ESC/POS (tối đa {}×{} dots)",
+            page.width,
+            page.height,
+            u16::MAX as u32 * 8,
+            u16::MAX
+        ));
+    }
+    let expected = (page.width as u64)
+        .checked_mul(page.height as u64)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "PWG: kích thước buffer trang tràn số học".to_string())?;
+    if page.rgba.len() as u64 != expected {
+        return Err(format!(
+            "PWG: kích thước trang {}x{} không khớp buffer {} bytes (cần {})",
+            page.width,
+            page.height,
+            page.rgba.len(),
+            expected
+        ));
+    }
+    image::RgbaImage::from_raw(page.width, page.height, page.rgba.clone())
+        .map(DynamicImage::ImageRgba8)
+        .ok_or_else(|| "PWG: không tạo được ảnh RGBA từ buffer trang".to_string())
 }
 
 fn render_pages_to_escpos(pages: &[pwg::PwgPage]) -> Result<Vec<u8>, String> {
@@ -412,9 +443,7 @@ pub async fn handle_ipp_request(state: &AppState, body: &[u8]) -> (Vec<u8>, Stri
             (response, format!("IPP Create-Job id={}", job_id))
         }
         OP_SEND_DOCUMENT => {
-            let job_id = request
-                .string_value("job-id")
-                .and_then(|s| s.parse::<i32>().ok());
+            let job_id = request.integer_value("job-id");
             print_job(state, &request, job_id).await
         }
         OP_CANCEL_JOB => {
@@ -451,6 +480,22 @@ pub async fn handle_ipp_request(state: &AppState, body: &[u8]) -> (Vec<u8>, Stri
     }
 }
 
+fn is_raw_document_format(format: Option<&str>) -> bool {
+    format
+        .map(|value| {
+            let normalized = value.trim().to_lowercase();
+            normalized.is_empty()
+                || matches!(
+                    normalized.as_str(),
+                    "application/octet-stream"
+                        | "application/vnd.hp-pcl"
+                        | "text/plain"
+                        | "application/x-ghitaprint-raw"
+                )
+        })
+        .unwrap_or(true)
+}
+
 async fn print_job(
     state: &AppState,
     request: &IppRequest,
@@ -460,26 +505,35 @@ async fn print_job(
     let compression = request.string_value("compression");
     let document_format = request.string_value("document-format");
 
-    let print_bytes = match pwg::decode_pwg_document(&request.data, compression.as_deref()) {
-        Ok(pages) => match render_pages_to_escpos(&pages) {
-            Ok(bytes) => {
-                tracing::info!(
-                    "IPP job {}: decode PWG {} trang → {} bytes ESC/POS",
-                    job_id,
-                    pages.len(),
-                    bytes.len()
-                );
-                Ok(bytes)
-            }
-            Err(e) => Err(e),
-        },
+    let decode_permit = state.decode_permits.clone().acquire_owned().await.ok();
+    let decoded = tokio::task::spawn_blocking({
+        let data = request.data.clone();
+        let compression = compression.clone();
+        move || {
+            pwg::decode_pwg_document(&data, compression.as_deref())
+                .and_then(|pages| render_pages_to_escpos(&pages))
+        }
+    })
+    .await
+    .unwrap_or_else(|join_error| Err(format!("Task decode bị hủy: {}", join_error)));
+    drop(decode_permit);
+
+    let print_bytes = match decoded {
+        Ok(bytes) => {
+            tracing::info!(
+                "IPP job {}: decode PWG → {} bytes ESC/POS",
+                job_id,
+                bytes.len()
+            );
+            Ok(bytes)
+        }
         Err(pwg_error) => {
             if request.data.is_empty() {
                 Err(format!(
                     "IPP job {}: không có dữ liệu trang in — {}",
                     job_id, pwg_error
                 ))
-            } else {
+            } else if is_raw_document_format(document_format.as_deref()) {
                 tracing::warn!(
                     "IPP job {}: PWG decode thất bại ({}), fallback in thô {} bytes (format: {:?})",
                     job_id,
@@ -488,6 +542,13 @@ async fn print_job(
                     document_format
                 );
                 Ok(request.data.clone())
+            } else {
+                Err(format!(
+                    "IPP job {}: dữ liệu PWG/raster không giải mã được ({}), đã hủy job thay vì in rác {} bytes",
+                    job_id,
+                    pwg_error,
+                    request.data.len()
+                ))
             }
         }
     };
@@ -544,4 +605,81 @@ async fn print_job(
             }
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_raw_document_format_whitelist() {
+        assert!(is_raw_document_format(None));
+        assert!(is_raw_document_format(Some("")));
+        assert!(is_raw_document_format(Some("  APPLICATION/OCTET-STREAM  ")));
+        assert!(is_raw_document_format(Some("application/vnd.hp-pcl")));
+        assert!(is_raw_document_format(Some("text/plain")));
+        assert!(is_raw_document_format(Some("application/x-ghitaprint-raw")));
+    }
+
+    #[test]
+    fn test_is_raw_document_format_rejects_raster_formats() {
+        assert!(!is_raw_document_format(Some("image/pwg-raster")));
+        assert!(!is_raw_document_format(Some("image/urf")));
+        assert!(!is_raw_document_format(Some("application/pdf")));
+        assert!(!is_raw_document_format(Some("application/vnd.cups-raster")));
+    }
+
+    #[test]
+    fn test_page_to_dynamic_image_uses_rgba_stride() {
+        let page = pwg::PwgPage {
+            width: 2,
+            height: 1,
+            rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
+        };
+        let image = page_to_dynamic_image(&page).expect("RGBA buffer phải được chấp nhận");
+        let rgba = image.to_rgba8();
+        assert_eq!(rgba.get_pixel(0, 0).0, [10, 20, 30, 255]);
+        assert_eq!(rgba.get_pixel(1, 0).0, [40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn test_page_to_dynamic_image_rejects_rgb_sized_buffer() {
+        let page = pwg::PwgPage {
+            width: 2,
+            height: 1,
+            rgba: vec![10, 20, 30, 40, 50, 60],
+        };
+        assert!(page_to_dynamic_image(&page).is_err());
+    }
+
+    #[test]
+    fn test_page_to_dynamic_image_rejects_oversized_raster_dimensions() {
+        let page = pwg::PwgPage {
+            width: 200,
+            height: u16::MAX as u32 + 1,
+            rgba: Vec::new(),
+        };
+        let error = page_to_dynamic_image(&page).expect_err("chiều cao > u16 phải bị từ chối");
+        assert!(error.contains("raster"), "{}", error);
+    }
+
+    #[test]
+    fn test_integer_value_reads_binary_integer() {
+        let request = IppRequest {
+            version: (1, 1),
+            operation: OP_SEND_DOCUMENT,
+            request_id: 1,
+            groups: vec![(
+                1,
+                vec![IppAttribute {
+                    tag: TAG_INTEGER,
+                    name: "job-id".to_string(),
+                    value: 42i32.to_be_bytes().to_vec(),
+                }],
+            )],
+            data: Vec::new(),
+        };
+        assert_eq!(request.integer_value("job-id"), Some(42));
+        assert_eq!(request.integer_value("missing"), None);
+    }
 }

@@ -64,6 +64,10 @@ impl Settings {
             warn!("api_port = 0 không hợp lệ — dùng mặc định 9123");
             self.api_port = 9123;
         }
+        if self.api_port == u16::MAX {
+            warn!("api_port = 65535 không hợp lệ (raw spooler cần port+1) — dùng 65534");
+            self.api_port = u16::MAX - 1;
+        }
         if self.connection_timeout_secs == 0 {
             warn!("connection_timeout_secs = 0 không hợp lệ — dùng mặc định 5 giây");
             self.connection_timeout_secs = 5;
@@ -206,11 +210,12 @@ impl ConfigManager {
     }
 
     fn tmp_path(&self) -> PathBuf {
-        self.path.with_extension("toml.tmp")
+        self.path
+            .with_extension(format!("toml.{}.tmp", std::process::id()))
     }
 
     pub fn load(&self) -> Settings {
-        let _ = fs::remove_file(self.tmp_path());
+        crate::status::set_config_warning(None);
 
         if !self.path.exists() {
             return Settings::default().normalized();
@@ -224,6 +229,11 @@ impl ConfigManager {
                     self.path.display(),
                     e
                 );
+                crate::status::set_config_warning(Some(format!(
+                    "Không đọc được {}: {} — đang dùng cấu hình mặc định",
+                    self.path.display(),
+                    e
+                )));
                 return Settings::default().normalized();
             }
         };
@@ -243,12 +253,22 @@ impl ConfigManager {
                                 "Đã khôi phục cấu hình từ backup {}. Nên chạy 'ghitaprint config set api_port <port>' để ghi lại file sạch.",
                                 self.backup_path().display()
                             );
+                            crate::status::set_config_warning(Some(format!(
+                                "Cấu hình chính hỏng ({}) — đang dùng backup {}",
+                                parse_error,
+                                self.backup_path().display()
+                            )));
                             return settings.normalized();
                         }
                         Err(_) => warn!("Backup cấu hình cũng hỏng — dùng cấu hình mặc định"),
                     },
                     Err(_) => warn!("Không có backup cấu hình — dùng cấu hình mặc định"),
                 }
+                crate::status::set_config_warning(Some(format!(
+                    "Cấu hình {} hỏng ({}) và không có backup hợp lệ — đang dùng mặc định",
+                    self.path.display(),
+                    parse_error
+                )));
                 Settings::default().normalized()
             }
         }
@@ -264,14 +284,17 @@ impl ConfigManager {
         let tmp_path = self.tmp_path();
         fs::write(&tmp_path, &toml_str)?;
 
-        if self.path.exists() {
+        let had_existing = self.path.exists();
+        if had_existing {
             let _ = fs::copy(&self.path, self.backup_path());
         }
 
         fs::rename(&tmp_path, &self.path).inspect_err(|_| {
             let _ = fs::remove_file(&tmp_path);
         })?;
-        let _ = fs::copy(&self.path, self.backup_path());
+        if !had_existing {
+            let _ = fs::copy(&self.path, self.backup_path());
+        }
         Ok(())
     }
 
@@ -337,6 +360,15 @@ mod tests {
         let fixed = broken.normalized();
         assert_eq!(fixed.api_port, 9123);
         assert_eq!(fixed.connection_timeout_secs, 5);
+    }
+
+    #[test]
+    fn test_normalized_fixes_port_65535_for_raw_port() {
+        let broken = Settings {
+            api_port: u16::MAX,
+            ..Settings::default()
+        };
+        assert_eq!(broken.normalized().api_port, u16::MAX - 1);
     }
 
     #[test]
@@ -410,6 +442,13 @@ mod tests {
         let reloaded = mgr.load();
         assert_eq!(reloaded.api_port, 9400);
         assert_eq!(reloaded.api_token, "keepme");
+
+        let backup = fs::read_to_string(dir.path().join("ghitaprint.toml.bak")).unwrap();
+        let backup_settings: Settings = toml::from_str(&backup).unwrap();
+        assert_eq!(
+            backup_settings.api_port, 9300,
+            "backup phải giữ cấu hình CŨ trước lần save thứ hai"
+        );
     }
 
     #[test]
@@ -422,15 +461,22 @@ mod tests {
     }
 
     #[test]
-    fn test_load_removes_stale_tmp_file() {
+    fn test_save_uses_pid_scoped_tmp_and_cleans_it_up() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("ghitaprint.toml");
-        fs::write(dir.path().join("ghitaprint.toml.tmp"), "rác").unwrap();
-        fs::write(&config_path, "api_port = 9200\n").unwrap();
+        let mgr = ConfigManager::with_path(config_path.clone());
+        let settings = Settings {
+            api_port: 9200,
+            ..Settings::default()
+        };
 
-        let mgr = ConfigManager::with_path(config_path);
-        let _ = mgr.load();
-        assert!(!dir.path().join("ghitaprint.toml.tmp").exists());
+        mgr.save(&settings).expect("save phải thành công");
+
+        let scoped_tmp = dir
+            .path()
+            .join(format!("ghitaprint.toml.{}.tmp", std::process::id()));
+        assert!(!scoped_tmp.exists());
+        assert_eq!(mgr.load().api_port, 9200);
     }
 
     #[test]

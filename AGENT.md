@@ -1,6 +1,6 @@
 # 📋 AGENT GUIDELINES & PROJECT RULES
 
-> **Phiên bản hiện tại của dự án:** `0.0.3-preview`
+> **Phiên bản hiện tại của dự án:** `0.0.3`
 
 Tài liệu này định nghĩa các nguyên tắc phát triển và quy định bắt buộc đối với AI Agent và lập trình viên khi làm việc trong dự án **GhitaPrint**:
 

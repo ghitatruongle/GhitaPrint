@@ -31,6 +31,12 @@ impl FloydSteinbergRasterizer {
         let resized_owned;
         let source: &DynamicImage = if eff_w != w {
             let target_h = (((h as f64) * (eff_w as f64 / w as f64)).round() as u32).max(1);
+            if target_h > MAX_RASTER_HEIGHT_DOTS {
+                return Err(format!(
+                    "Ảnh cao {} dots sau co giãn vượt giới hạn máy in {} dots — hãy cắt ảnh ngắn lại hoặc giảm --image-width",
+                    target_h, MAX_RASTER_HEIGHT_DOTS
+                ));
+            }
             resized_owned =
                 img.resize_exact(eff_w, target_h, image::imageops::FilterType::Triangle);
             &resized_owned

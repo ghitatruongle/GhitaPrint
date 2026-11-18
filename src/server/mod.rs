@@ -25,7 +25,10 @@ pub fn daemon_pid_file() -> Option<PathBuf> {
 pub fn daemon_process_file_name() -> String {
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.file_name().map(|name| name.to_string_lossy().to_string()))
+        .and_then(|exe| {
+            exe.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
         .unwrap_or_else(|| "ghitaprint.exe".to_string())
 }
 
@@ -62,12 +65,37 @@ pub fn write_pid_file() {
             && is_live_ghitaprint_pid(existing)
         {
             tracing::warn!(
-                "daemon.pid đã trỏ tới tiến trình ghitaprint đang sống (PID {}) — ghi đè. Nếu chạy đa cổng, 'daemon --stop' sẽ dừng daemon mới nhất.",
+                "daemon.pid đã trỏ tới tiến trình ghitaprint đang sống (PID {}) — dừng tiến trình cũ để tiếp quản",
                 existing
             );
+            if crate::os::process::terminate_process(existing) {
+                tracing::warn!(
+                    "Đã dừng daemon cũ (PID {}) để tránh hai instance tranh chấp",
+                    existing
+                );
+            } else {
+                tracing::warn!(
+                    "Không dừng được daemon cũ (PID {}) — vẫn ghi đè daemon.pid sang PID mới",
+                    existing
+                );
+            }
         }
         let _ = std::fs::write(&path, std::process::id().to_string());
     }
+}
+
+pub fn terminate_stale_daemons() -> Vec<u32> {
+    let self_pid = std::process::id();
+    let mut stopped = Vec::new();
+    for pid in crate::os::process::process_pids_by_image("ghitaprint.exe") {
+        if pid == self_pid || !is_live_ghitaprint_pid(pid) {
+            continue;
+        }
+        if crate::os::process::terminate_process(pid) {
+            stopped.push(pid);
+        }
+    }
+    stopped
 }
 
 pub fn read_daemon_pid() -> Option<u32> {
@@ -95,26 +123,28 @@ pub async fn probe_health(port: u16, attempts: u32) -> Option<String> {
                 "GET /api/v1/health HTTP/1.0\r\nHost: 127.0.0.1:{}\r\n\r\n",
                 port
             );
-            if stream.write_all(request.as_bytes()).await.is_ok() {
+            let exchange = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                stream.write_all(request.as_bytes()).await.ok()?;
                 let mut buf = vec![0u8; 2048];
-                if let Ok(n) = stream.read(&mut buf).await {
-                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                    if text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200") {
-                        if let Some(body_start) = text.find('{')
-                            && let Ok(json) =
-                                serde_json::from_str::<serde_json::Value>(&text[body_start..])
-                        {
-                            return json["version"].as_str().map(|s| s.to_string());
-                        }
-                        return Some(env!("CARGO_PKG_VERSION").to_string());
-                    }
-                }
+                let n = stream.read(&mut buf).await.ok()?;
+                Some(String::from_utf8_lossy(&buf[..n]).to_string())
+            })
+            .await;
+            if let Ok(Some(text)) = exchange
+                && (text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200"))
+                && let Some(body_start) = text.find('{')
+                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text[body_start..])
+                && let Some(version) = json["version"].as_str()
+            {
+                return Some(version.to_string());
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
     None
 }
+
+pub const SHUTDOWN_GRACE_SECS: u64 = 10;
 
 pub async fn start_server(config: DaemonServerConfig) -> Result<(), std::io::Error> {
     let DaemonServerConfig {
@@ -131,6 +161,7 @@ pub async fn start_server(config: DaemonServerConfig) -> Result<(), std::io::Err
     if let Some(dir) = status::status_dir() {
         status::init_status_file(dir.join(status::STATUS_FILE_NAME));
     }
+    sweep_stale_status_tmp();
     let state = AppState::new(
         default_printer,
         timeout_secs,
@@ -147,6 +178,7 @@ pub async fn start_server(config: DaemonServerConfig) -> Result<(), std::io::Err
     match tokio::net::TcpListener::bind(("127.0.0.1", raw_port)).await {
         Ok(raw_listener) => {
             tracing::info!("Raw spooler listener đã bind tại 127.0.0.1:{}", raw_port);
+            status::set_raw_port_ok(true);
             let raw_state = state.clone();
             tokio::spawn(async move {
                 if let Err(error) =
@@ -162,6 +194,7 @@ pub async fn start_server(config: DaemonServerConfig) -> Result<(), std::io::Err
                 raw_port,
                 error
             );
+            status::set_raw_port_ok(false);
         }
     }
 
@@ -199,6 +232,15 @@ pub async fn start_server(config: DaemonServerConfig) -> Result<(), std::io::Err
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("Nhận tín hiệu dừng (Ctrl+C) — đang tắt mềm...");
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS)).await;
+            tracing::warn!(
+                "Tắt mềm vượt quá {} giây — buộc dừng daemon để không treo tiến trình",
+                SHUTDOWN_GRACE_SECS
+            );
+            remove_pid_file();
+            std::process::exit(0);
+        });
     };
 
     let serve_result = axum::serve(listener, app)
@@ -209,6 +251,32 @@ pub async fn start_server(config: DaemonServerConfig) -> Result<(), std::io::Err
     serve_result
 }
 
+fn sweep_stale_status_tmp() {
+    let Some(dir) = status::status_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let self_suffix = format!(".{}.tmp", std::process::id());
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        if !name.starts_with("status.json")
+            || !name.ends_with(".tmp")
+            || name.ends_with(&self_suffix)
+        {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 fn write_initial_status(port: u16) {
     let snapshot = status::StatusSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -217,6 +285,8 @@ fn write_initial_status(port: u16) {
         boot_started_at_ms: status::boot_started_ms(),
         ready_at_ms: status::ready_at_ms(),
         ready_after_ms: status::boot_to_ready_ms(),
+        config_warning: status::current_config_warning(),
+        raw_port_ok: status::current_raw_port_ok(),
         updated_at_ms: status::now_ms(),
         ..status::StatusSnapshot::default()
     };

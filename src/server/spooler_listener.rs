@@ -3,6 +3,7 @@ use super::routes::{AppState, execute_print};
 
 pub const RAW_READ_TIMEOUT_SECS: u64 = 60;
 pub const MAX_SPOOLER_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_CONCURRENT_SPOOLER_CONNECTIONS: usize = 4;
 
 pub enum SpoolerPayload<'a> {
     Pdf(&'a [u8]),
@@ -75,6 +76,10 @@ pub async fn run_raw_listener_on(
             .unwrap_or_default()
     );
 
+    let connection_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_SPOOLER_CONNECTIONS,
+    ));
+
     loop {
         let (mut socket, peer) = match listener.accept().await {
             Ok(connection) => connection,
@@ -84,8 +89,22 @@ pub async fn run_raw_listener_on(
             }
         };
 
+        let permit = match connection_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    "Từ chối kết nối spooler {} — đã đạt giới hạn {} kết nối đồng thời",
+                    peer,
+                    MAX_CONCURRENT_SPOOLER_CONNECTIONS
+                );
+                drop(socket);
+                continue;
+            }
+        };
+
         let state_clone = state.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let read_result = tokio::time::timeout(
                 std::time::Duration::from_secs(RAW_READ_TIMEOUT_SECS),
                 read_connection(&mut socket, MAX_SPOOLER_PAYLOAD_BYTES),

@@ -5,6 +5,64 @@ Toàn bộ thay đổi đáng chú ý của **GhitaPrint** được ghi nhận t
 
 ---
 
+## [0.0.3] — 2026-11-18
+
+**Bản ổn định chính thức.** Kế thừa toàn bộ hardening từ `0.0.3-preview` và vá dứt điểm 2 lỗi vận hành
+từ đợt thử nghiệm thực tế (cần reboot/new login để watch chạy; daemon cũ bị bỏ lại khi cài đè).
+
+### 🚀 Tự khởi động & companion chạy ngay (A1)
+- `spawn_detached` truyền **thư mục làm việc tường minh** (thư mục chứa exe) cho `CreateProcessW` —
+  daemon con không còn kế thừa CWD của setup.exe (nếu CWD có `ghitaprint.toml`, guard S6 từng từ chối
+  khởi động khiến health probe lặng lẽ thất bại).
+- Registry Run `GhitaPrintWatch` đổi thành `"exe" watch --hidden`; cờ `--hidden` re-exec watch detached
+  với `CREATE_NO_WINDOW` (không còn cửa sổ console treo sau log-in); `watch.exe` có
+  `windows_subsystem = "windows"`.
+- `startup install` và bộ cài **khởi chạy watch ngay** sau khi đăng ký — không cần reboot/log-out.
+  Bộ cài retry daemon 3× (cách nhau 2 s), ghi `%APPDATA%\GhitaPrint\install.log`, giữ console khi lỗi,
+  và tính `autostart` là bước **critical** (trước đây chỉ `extract_exe` + `daemon`).
+- Setup **kiểm tra phiên bản health trùng `env!("CARGO_PKG_VERSION")`** — không còn báo thành công khi
+  một daemon cũ đang giữ cổng.
+
+### 🧹 Dọn instance mồ côi & tắt máy sạch (A2/B2/B3/B4)
+- `daemon --stop` quét cả tiến trình `ghitaprint.exe` theo image name (fallback khi `daemon.pid` sai/mất),
+  dọn luôn watch companion; ghi marker `daemon.stopped` để watchdog **không hồi sinh** daemon sau lệnh stop.
+- `write_pid_file` chủ động terminate daemon cũ đang chiếm `daemon.pid` trước khi tiếp quản; shutdown có
+  **hard-stop sau 10 s** nếu graceful shutdown treo; panic hook xóa pid **trước** mọi thao tác ghi log
+  và bỏ `eprintln!` (tránh double-panic dưới `panic = "abort"`).
+- Watch dedup job theo **`id` tăng dần** thay vì `created_at_ms` (miễn nhiễm lệch đồng hồ/NTP) và reset
+  baseline khi đổi PID.
+
+### 🛡️ Watchdog và giới hạn tài nguyên (B1/C1–C6)
+- Watch **tự khởi động lại daemon** khi phát hiện chết: cooldown 60 s, tối đa 5 lần / 10 phút, ghi
+  `events.log` + toast; toast PowerShell bị thu hồi sau 5 s; `run_powershell_utf8` có timeout 30 s + kill.
+- IPP: decode PWG trong `spawn_blocking` với semaphore 2 permit; **PWG/raster hỏng bị hủy job**
+  (`CLIENT_FORMAT_NOT_SUPPORTED`) thay vì in rác byte thô.
+- REST `/print` + `/print/raw` cap 16 lệnh đồng thời (429 `busy`); WS cap 32 kết nối (503 `busy`);
+  raw spooler listener cap 4 kết nối; trạng thái bind raw port (`raw_port_ok`) được phản ánh trong
+  `status.json`.
+- Sweep file `status.json.*.tmp` mồ côi lúc daemon khởi động; dọn log/events định kỳ mỗi 6 giờ.
+- `status.json` có `config_warning` khi đọc config thất bại/dùng backup — không còn fallback im lặng.
+
+### 📦 Khác
+### 🔍 Review/debug toàn bộ codebase (29 file, ~10.200 dòng)
+- Sửa lỗi HIGH: IPP raster dùng sai stride RGB cho buffer RGBA (mọi job PWG bị lệch màu) — giờ dùng
+  `RgbaImage` + kiểm tra độ dàistrict + chặn trang cao quá giới hạn `u16` của ESC/POS; `daemon --restart`
+  không còn giết watch companion rồi bỏ mặc (tự ensure companion); installer không còn `taskkill /IM
+  watch.exe /F` giết nhầm tiến trình của app khác (chỉ kill theo PID thuộc install dir).
+- Sửa lỗi MEDIUM: WS có cross-site guard chống CSRF-print; IPP `job-id` đọc đúng INTEGER nhị phân;
+  config backup không bị ghi đè bởi config mới; health probe có socket timeout và không tự nhận diện
+  dịch vụ lạ; PowerShell trả stdout riêng stderr (không phá protocol OK/1); text ESC/POS lọc control
+  ở mọi mode (`auto`/`strip`/`keep`/`raw`); scan subnet mask đúng CIDR bất kể hostIP.
+- Sửa lỗi LOW: tmp config theo PID; `daemon` flags loại trừ nhau; guard CWD trả JSON khi `--json`;
+  chặn `api_port=65535` (raw port wrap về 0); print lock release thực sự xóa entry; port IPv6 bare
+  normalize đúng `[::1]:9100`; image rejection trước khi resize khổng lồ; uninstall báo lỗi Registry/
+  PATH thật; install.log ghi cả lỗi sớm; tách throttle toast daemon-death khỏi print-failure.
+
+- Cargo version `0.0.3`; **152 tests** (147 lib + 5 setup); clippy 0 warning; `cargo fmt` sạch.
+- Bộ cài `GhitaPrint_0.0.3.exe` SHA-256
+  `ff39befb64499f07184e39ddc0491e6e7d9cc52b24f63a66c7bbd7eb67ab1083` (payload nhúng khớp
+  `fd0303771ec1b533644d149295499dea0b3ef0fe0dd15beff4eac9bb2b72fbd3`).
+
 ## [0.0.3-preview] — 2026-11-10
 
 ### 🛡️ Bảo mật — vá 6 lỗ hổng từ audit sâu (S1–S6)

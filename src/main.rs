@@ -41,10 +41,12 @@ async fn main() -> ExitCode {
     );
 
     if is_daemon_run && config_mgr.is_cwd_override() {
-        print_error(
-            "Phát hiện ghitaprint.toml trong thư mục hiện tại đang đè lên cấu hình hệ thống (%APPDATA%\\GhitaPrint). \
-             Daemon từ chối khởi động để tránh chạy sai cấu hình — xóa/dời file này hoặc dùng --config-path.",
-        );
+        let message = "Phát hiện ghitaprint.toml trong thư mục hiện tại đang đè lên cấu hình hệ thống (%APPDATA%\\GhitaPrint). Daemon từ chối khởi động để tránh chạy sai cấu hình — xóa/dời file này hoặc dùng --config-path.";
+        if args.json {
+            emit_json(&json_result(false, "cwd_override", message));
+        } else {
+            print_error(message);
+        }
         return ExitCode::from(EXIT_USAGE);
     }
 
@@ -74,7 +76,12 @@ async fn main() -> ExitCode {
         Commands::Daemon(daemon_args) => run_daemon(&daemon_args, &settings, args.json).await,
         Commands::Status => run_status(&settings, args.json).await,
         Commands::Watch(watch_args) => {
-            ghitaprint::watch::run_watch(watch_args.interval_ms, watch_args.no_toast, watch_args.once);
+            ghitaprint::watch::run_watch_with_hidden(
+                watch_args.interval_ms,
+                watch_args.no_toast,
+                watch_args.once,
+                watch_args.hidden,
+            );
             ExitCode::from(EXIT_OK)
         }
     }
@@ -90,6 +97,7 @@ fn init_tracing(level: &str, to_file: bool) {
     );
     if to_file && let Some(dir) = log_dir() {
         cleanup_old_logs(&dir);
+        spawn_log_maintenance(dir.clone());
         let appender = tracing_appender::rolling::daily(&dir, "ghitaprint.log");
         subscriber
             .with(
@@ -111,10 +119,7 @@ fn log_dir() -> Option<std::path::PathBuf> {
 }
 
 fn install_panic_hook() {
-    let Some(dir) = log_dir() else {
-        return;
-    };
-    let crash_path = dir.join("crash.log");
+    let log_directory = log_dir();
     std::panic::set_hook(Box::new(move |info| {
         ghitaprint::server::remove_pid_file();
         let timestamp = std::time::SystemTime::now()
@@ -122,20 +127,35 @@ fn install_panic_hook() {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let entry = format!("[unix {}] PANIC: {}\n", timestamp, info);
-        eprintln!(
-            "✖ Lỗi nghiêm trọng trong daemon — chi tiết tại {}",
-            crash_path.display()
-        );
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&crash_path)
-            .and_then(|mut file| writeln!(file, "{}", entry));
+        if let Some(dir) = log_directory.as_ref() {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("crash.log"))
+                .and_then(|mut file| file.write_all(entry.as_bytes()));
+        }
     }));
 }
 
 const LOG_RETENTION_DAYS: u64 = 7;
 const CRASH_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const LOG_MAINTENANCE_INTERVAL_HOURS: u64 = 6;
+
+fn spawn_log_maintenance(dir: std::path::PathBuf) {
+    let app_dir = dir
+        .parent()
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_else(|| dir.clone());
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(
+                LOG_MAINTENANCE_INTERVAL_HOURS * 3600,
+            ));
+            cleanup_old_logs(&dir);
+            ghitaprint::watch::prune_old_events(&app_dir);
+        }
+    });
+}
 
 fn cleanup_old_logs(dir: &Path) {
     let retention = std::time::Duration::from_secs(LOG_RETENTION_DAYS * 24 * 60 * 60);
@@ -164,6 +184,20 @@ fn cleanup_old_logs(dir: &Path) {
         && meta.len() > CRASH_LOG_MAX_BYTES
     {
         let _ = std::fs::rename(&crash_log, dir.join("crash.log.old"));
+    }
+    let crash_old = dir.join("crash.log.old");
+    if let Ok(meta) = std::fs::metadata(&crash_old)
+        && meta.len() > CRASH_LOG_MAX_BYTES
+    {
+        let _ = std::fs::remove_file(&crash_old);
+    }
+    if let Some(app_dir) = dir.parent() {
+        let events_old = app_dir.join("events.log.old");
+        if let Ok(meta) = std::fs::metadata(&events_old)
+            && meta.len() > CRASH_LOG_MAX_BYTES
+        {
+            let _ = std::fs::remove_file(&events_old);
+        }
     }
 }
 
@@ -552,9 +586,14 @@ async fn run_daemon(
     let env_port = std::env::var("GHITAPRINT_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok());
-    let daemon_port = daemon_args.port.or(env_port).unwrap_or(settings.api_port);
+    let daemon_port = daemon_args
+        .port
+        .or(env_port)
+        .unwrap_or(settings.api_port)
+        .min(u16::MAX - 1);
 
     if daemon_args.start && daemon_args.hidden {
+        ghitaprint::watch::clear_stop_marker();
         if spawn_hidden_daemon(settings) {
             if json {
                 emit_json(&json_result(true, "ok", "Daemon nền đã khởi chạy ẩn"));
@@ -569,11 +608,14 @@ async fn run_daemon(
     }
 
     if daemon_args.start || daemon_args.restart {
+        ghitaprint::watch::clear_stop_marker();
         if daemon_args.restart {
             print_info("Đang khởi động lại GhitaPrint Daemon...");
             stop_running_daemon();
+            ghitaprint::watch::clear_stop_marker();
             wait_port_released(daemon_port).await;
         }
+        ensure_watch_companion();
         run_daemon_foreground(daemon_port, settings, json).await
     } else if daemon_args.stop {
         print_info("Đang dừng GhitaPrint Daemon...");
@@ -604,17 +646,29 @@ async fn run_startup(action: StartupAction, json: bool) -> ExitCode {
             }
             let daemon_result = ghitaprint::os::install_startup();
             let watch_result = ghitaprint::os::install_watch_startup();
+            let mut watch_launch_note = String::new();
+            if watch_result.is_ok() {
+                watch_launch_note = if ensure_watch_companion() {
+                    "watch đã sẵn sàng".to_string()
+                } else {
+                    "chưa khởi chạy được watch ngay — sẽ tự chạy ở lần đăng nhập sau".to_string()
+                };
+            }
             match (daemon_result, watch_result) {
                 (Ok(daemon_cmd), Ok(watch_cmd)) => {
                     if json {
                         emit_json(&serde_json::json!({
                             "daemon": daemon_cmd,
-                            "watch": watch_cmd
+                            "watch": watch_cmd,
+                            "watch_launch": watch_launch_note
                         }));
                     } else {
                         print_success("Đã kích hoạt tự khởi động ẩn cùng Windows thành công!");
                         println!("  Daemon : {}", daemon_cmd);
                         println!("  Watch  : {}", watch_cmd);
+                        if !watch_launch_note.is_empty() {
+                            println!("  Trạng thái: {}", watch_launch_note);
+                        }
                     }
                     ExitCode::from(EXIT_OK)
                 }
@@ -906,7 +960,11 @@ async fn run_status(settings: &Settings, json: bool) -> ExitCode {
                 job.id,
                 if job.success { "OK" } else { "LỖI" },
                 job.bytes_sent,
-                if job.target.is_empty() { "(không target)" } else { &job.target },
+                if job.target.is_empty() {
+                    "(không target)"
+                } else {
+                    &job.target
+                },
                 job.source
             );
         }
@@ -984,39 +1042,57 @@ fn spawn_hidden_daemon(_settings: &Settings) -> bool {
     false
 }
 
+fn ensure_watch_companion() -> bool {
+    if !ghitaprint::os::is_watch_startup_enabled() {
+        return false;
+    }
+    if ghitaprint::watch::is_watch_running() {
+        return true;
+    }
+    ghitaprint::watch::spawn_hidden_watch(500, false)
+}
+
 #[cfg(windows)]
 fn stop_running_daemon() -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        PROCESS_TERMINATE, OpenProcess, TerminateProcess,
-    };
-
     let self_pid = std::process::id();
-    let Some(pid) = server::read_daemon_pid().filter(|candidate| *candidate != self_pid) else {
-        return false;
-    };
+    ghitaprint::watch::write_stop_marker();
 
-    if !server::is_live_ghitaprint_pid(pid) {
+    let mut stopped = false;
+    if let Some(pid) = server::read_daemon_pid().filter(|candidate| *candidate != self_pid) {
+        if server::is_live_ghitaprint_pid(pid) {
+            stopped = ghitaprint::os::process::terminate_process(pid);
+            if !stopped {
+                tracing::warn!("Không thể dừng daemon PID {} — tiếp tục quét toàn bộ", pid);
+            }
+        } else {
+            tracing::warn!(
+                "PID {} trong daemon.pid không còn là tiến trình ghitaprint (PID-reuse?) — quét lại theo image name",
+                pid
+            );
+        }
+    } else {
+        tracing::warn!("Không có daemon.pid — quét toàn bộ tiến trình ghitaprint.exe");
+    }
+
+    let leftovers = server::terminate_stale_daemons();
+    if !leftovers.is_empty() {
         tracing::warn!(
-            "PID {} trong daemon.pid không còn là tiến trình ghitaprint (PID-reuse?) — bỏ qua kill, chỉ dọn file",
-            pid
+            "Đã dừng thêm {} instance ghitaprint ngoài daemon.pid: {:?}",
+            leftovers.len(),
+            leftovers
         );
-        server::remove_pid_file();
-        return false;
-    }
-
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
-    let terminated = unsafe { TerminateProcess(handle, 1) } != 0;
-    unsafe {
-        let _ = CloseHandle(handle);
+        stopped = true;
     }
 
     std::thread::sleep(std::time::Duration::from_millis(400));
     server::remove_pid_file();
-    terminated
+    if let Some(pid) = ghitaprint::watch::read_watch_pid()
+        && ghitaprint::watch::is_watch_pid_live(pid)
+        && ghitaprint::os::process::terminate_process(pid)
+    {
+        ghitaprint::watch::clear_stale_watch_pid(pid);
+    }
+    stopped
 }
 
 #[cfg(not(windows))]

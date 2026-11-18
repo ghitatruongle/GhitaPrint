@@ -28,6 +28,9 @@ pub const WS_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const MAX_JOBS_IN_MEMORY: usize = 200;
 pub const MAX_PRINTER_LOCKS: usize = 256;
 pub const MAX_CONCURRENT_WS_PRINTS: usize = 8;
+pub const MAX_CONCURRENT_WS_CONNECTIONS: usize = 32;
+pub const MAX_CONCURRENT_REST_PRINTS: usize = 16;
+pub const MAX_CONCURRENT_DECODES: usize = 2;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -44,6 +47,9 @@ pub struct AppState {
     pub prints_ok: Arc<AtomicU64>,
     pub prints_failed: Arc<AtomicU64>,
     pub ws_print_permits: Arc<Semaphore>,
+    pub ws_connection_permits: Arc<Semaphore>,
+    pub rest_print_permits: Arc<Semaphore>,
+    pub decode_permits: Arc<Semaphore>,
     pub next_job_id: Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -82,6 +88,9 @@ impl AppState {
             prints_ok: Arc::new(AtomicU64::new(0)),
             prints_failed: Arc::new(AtomicU64::new(0)),
             ws_print_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_WS_PRINTS)),
+            ws_connection_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_WS_CONNECTIONS)),
+            rest_print_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REST_PRINTS)),
+            decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
             next_job_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
         }
     }
@@ -191,6 +200,8 @@ impl AppState {
             last_error: last_error_summary,
             jobs: jobs_for_file,
             virtual_printer: status::current_virtual_printer_check(),
+            config_warning: status::current_config_warning(),
+            raw_port_ok: status::current_raw_port_ok(),
             updated_at_ms: status::now_ms(),
         };
         if let Err(e) = status::write_status(&snapshot) {
@@ -442,13 +453,19 @@ fn browser_origin_host(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-        .and_then(|origin| origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")))
+        .and_then(|origin| {
+            origin
+                .strip_prefix("http://")
+                .or_else(|| origin.strip_prefix("https://"))
+        })
         .map(|host_port| {
             let host = host_port
                 .rsplit_once(':')
                 .map(|(host, _)| host)
                 .unwrap_or(host_port);
-            host.trim_start_matches('[').trim_end_matches(']').to_string()
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string()
         })
 }
 
@@ -634,7 +651,23 @@ async fn print_handler(
         }
     };
 
+    let permit = match state.rest_print_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let message = format!(
+                "Đang có quá nhiều lệnh in REST đồng thời (giới hạn {}), thử lại sau.",
+                MAX_CONCURRENT_REST_PRINTS
+            );
+            let resp = PrintResponse::failure("busy", &message, "", &mode);
+            state
+                .record_print("rest", "", &mode, false, &resp.code, &resp.message, 0)
+                .await;
+            return (StatusCode::TOO_MANY_REQUESTS, Json(resp)).into_response();
+        }
+    };
+
     let outcome = execute_print(&state, "rest", req.target.as_deref(), &bytes, &mode).await;
+    drop(permit);
     let status = if outcome.success {
         StatusCode::OK
     } else if outcome.timed_out {
@@ -674,7 +707,22 @@ async fn print_raw_handler(
     }
 
     let target = query.target.as_deref();
+    let permit = match state.rest_print_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let message = format!(
+                "Đang có quá nhiều lệnh in REST đồng thời (giới hạn {}), thử lại sau.",
+                MAX_CONCURRENT_REST_PRINTS
+            );
+            let resp = PrintResponse::failure("busy", &message, "", "raw");
+            state
+                .record_print("rest", "", "raw", false, &resp.code, &resp.message, 0)
+                .await;
+            return (StatusCode::TOO_MANY_REQUESTS, Json(resp)).into_response();
+        }
+    };
     let outcome = execute_print(&state, "rest", target, &body, "raw").await;
+    drop(permit);
     let status = if outcome.success {
         StatusCode::OK
     } else if outcome.timed_out {
@@ -750,7 +798,15 @@ pub async fn execute_print(
             mode,
         );
         state
-            .record_print(source, "", mode, false, &response.code, &response.message, 0)
+            .record_print(
+                source,
+                "",
+                mode,
+                false,
+                &response.code,
+                &response.message,
+                0,
+            )
             .await;
         return response;
     }
@@ -829,6 +885,7 @@ pub async fn execute_print(
     };
 
     drop(_guard);
+    drop(lock);
     state.release_printer_lock(&target).await;
 
     tracing::info!(
@@ -909,10 +966,39 @@ async fn ws_handler(
         )
             .into_response();
     }
+    if is_cross_site_browser(&headers)
+        && let Some(blocked) = enforce_cross_site_policy(&state, &headers)
+    {
+        return blocked;
+    }
     let handler_state = (*state).clone();
+    let connection_permit = match handler_state
+        .ws_connection_permits
+        .clone()
+        .try_acquire_owned()
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "success": false,
+                    "code": "busy",
+                    "message": format!(
+                        "Đã đạt giới hạn {} kết nối WebSocket đồng thời — đóng bớt client rồi thử lại.",
+                        MAX_CONCURRENT_WS_CONNECTIONS
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
     ws.max_message_size(WS_MAX_MESSAGE_BYTES)
         .max_frame_size(WS_MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_socket(handler_state, socket))
+        .on_upgrade(move |socket| async move {
+            let _connection_permit = connection_permit;
+            handle_socket(handler_state, socket).await;
+        })
 }
 
 async fn handle_socket(state: AppState, mut socket: WebSocket) {
@@ -1052,14 +1138,9 @@ fn handle_ws_text(state: &AppState, text: &str, tx: &tokio::sync::mpsc::Unbounde
                         return;
                     }
                 };
-                let outcome = execute_print(
-                    &state_clone,
-                    "ws",
-                    target_capture.as_deref(),
-                    &bytes,
-                    &mode,
-                )
-                .await;
+                let outcome =
+                    execute_print(&state_clone, "ws", target_capture.as_deref(), &bytes, &mode)
+                        .await;
                 let _ = tx_clone.send(Message::Text(
                     serde_json::json!({
                         "event": "print_result",
@@ -1520,6 +1601,26 @@ mod tests {
         assert!(constant_time_eq("", ""));
     }
 
+    #[test]
+    fn test_ws_cross_site_guard_classifies_browser_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://evil.example.com"),
+        );
+        assert!(is_cross_site_browser(&headers));
+        let state = test_state("");
+        assert!(enforce_cross_site_policy(&state, &headers).is_some());
+
+        let mut local = HeaderMap::new();
+        local.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:5500"),
+        );
+        assert!(!is_cross_site_browser(&local));
+        assert!(enforce_cross_site_policy(&state, &local).is_none());
+    }
+
     #[tokio::test]
     async fn test_ipp_rejects_browser_origin_without_token() {
         let app = create_router(test_state(""));
@@ -1692,12 +1793,24 @@ mod tests {
         let state = test_state("");
         state
             .record_print(
-                "rest", "127.0.0.1:9100", "raw", true, "ok", "In thành công", 42,
+                "rest",
+                "127.0.0.1:9100",
+                "raw",
+                true,
+                "ok",
+                "In thành công",
+                42,
             )
             .await;
         state
             .record_print(
-                "ws", "127.0.0.1:9101", "document", false, "transport_error", "Không thể kết nối", 0,
+                "ws",
+                "127.0.0.1:9101",
+                "document",
+                false,
+                "transport_error",
+                "Không thể kết nối",
+                0,
             )
             .await;
         let app = create_router(state);
@@ -1740,17 +1853,32 @@ mod tests {
         let jobs = state.jobs.lock().await;
         assert_eq!(jobs.len(), MAX_JOBS_IN_MEMORY);
         assert_eq!(jobs.back().unwrap().id, MAX_JOBS_IN_MEMORY as u32 + 50);
-        assert_eq!(state.prints_total.load(Ordering::SeqCst), (MAX_JOBS_IN_MEMORY + 50) as u64);
+        assert_eq!(
+            state.prints_total.load(Ordering::SeqCst),
+            (MAX_JOBS_IN_MEMORY + 50) as u64
+        );
     }
 
     #[tokio::test]
     async fn test_printer_lock_released_after_use() {
         let state = test_state("");
         let lock = state.printer_lock("usb://0416:5011").await;
-        assert!(state.printer_locks.lock().await.contains_key("usb://0416:5011"));
+        assert!(
+            state
+                .printer_locks
+                .lock()
+                .await
+                .contains_key("usb://0416:5011")
+        );
         drop(lock);
         state.release_printer_lock("usb://0416:5011").await;
-        assert!(!state.printer_locks.lock().await.contains_key("usb://0416:5011"));
+        assert!(
+            !state
+                .printer_locks
+                .lock()
+                .await
+                .contains_key("usb://0416:5011")
+        );
     }
 
     #[test]
@@ -1778,14 +1906,57 @@ mod tests {
         assert!(!is_cross_site_browser(&headers));
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "sec-fetch-site",
-            HeaderValue::from_static("cross-site"),
-        );
+        headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
         assert!(is_cross_site_browser(&headers));
 
         let headers = HeaderMap::new();
         assert!(!is_browser_request(&headers));
         assert!(!is_cross_site_browser(&headers));
+    }
+
+    #[tokio::test]
+    async fn test_app_state_initializes_all_resource_permits() {
+        let state = AppState::new(
+            String::new(),
+            5,
+            String::new(),
+            "auto".to_string(),
+            "escpos".to_string(),
+        );
+        assert_eq!(
+            state.rest_print_permits.available_permits(),
+            MAX_CONCURRENT_REST_PRINTS
+        );
+        assert_eq!(
+            state.decode_permits.available_permits(),
+            MAX_CONCURRENT_DECODES
+        );
+        assert_eq!(
+            state.ws_connection_permits.available_permits(),
+            MAX_CONCURRENT_WS_CONNECTIONS
+        );
+        assert_eq!(
+            state.ws_print_permits.available_permits(),
+            MAX_CONCURRENT_WS_PRINTS
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rest_print_cap_returns_busy_after_permits_exhausted() {
+        let state = test_state("");
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_REST_PRINTS {
+            held.push(
+                state
+                    .rest_print_permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(state.rest_print_permits.try_acquire().is_err());
+        held.clear();
+        assert!(state.rest_print_permits.try_acquire().is_ok());
     }
 }

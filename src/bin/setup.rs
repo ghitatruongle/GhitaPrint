@@ -6,6 +6,7 @@ use ghitaprint::server::virtual_printer::{
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -127,11 +128,44 @@ fn remove_from_path_value(current: &str, dir: &str) -> String {
         .join(";")
 }
 
-fn stop_running_instances() {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/IM", "ghitaprint.exe", "/F"])
-        .output();
+fn process_under_install_dir(pid: u32, install_dir: &Path) -> bool {
+    let Some(image) = ghitaprint::os::process::process_image_name(pid) else {
+        return false;
+    };
+    let image_path = PathBuf::from(image);
+    let normalized_install = install_dir.to_string_lossy().to_lowercase();
+    image_path
+        .parent()
+        .map(|parent| parent.to_string_lossy().to_lowercase() == normalized_install)
+        .unwrap_or(false)
+}
+
+fn stop_running_instances(install_dir: &Path) {
+    let own_daemon = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+    for name in ["ghitaprint.exe", "watch.exe"] {
+        if name.eq_ignore_ascii_case(&own_daemon) {
+            continue;
+        }
+        for pid in ghitaprint::os::process::process_pids_by_image(name) {
+            if process_under_install_dir(pid, install_dir) {
+                let _ = ghitaprint::os::process::terminate_process(pid);
+            }
+        }
+    }
+    if let Some(pid) = ghitaprint::watch::read_watch_pid()
+        && ghitaprint::watch::is_watch_pid_live(pid)
+        && process_under_install_dir(pid, install_dir)
+    {
+        let _ = ghitaprint::os::process::terminate_process(pid);
+    }
     std::thread::sleep(std::time::Duration::from_millis(300));
+    ghitaprint::watch::clear_markers_for_install();
 }
 
 #[cfg(windows)]
@@ -188,7 +222,7 @@ fn broadcast_environment_change() {
 #[cfg(windows)]
 fn install_registry_run(exe_path: &Path) -> std::io::Result<()> {
     let cmd = format!("\"{}\" daemon --start --hidden", exe_path.display());
-    let watch_cmd = format!("\"{}\" watch", exe_path.display());
+    let watch_cmd = format!("\"{}\" watch --hidden", exe_path.display());
     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
     let (key, _) = hkcu.create_subkey(REG_RUN_PATH)?;
     key.set_value(APP_NAME, &cmd)?;
@@ -197,12 +231,12 @@ fn install_registry_run(exe_path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn uninstall_registry_run() {
+fn uninstall_registry_run() -> std::io::Result<()> {
     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-    if let Ok(key) = hkcu.open_subkey_with_flags(REG_RUN_PATH, winreg::enums::KEY_WRITE) {
-        let _ = key.delete_value(APP_NAME);
-        let _ = key.delete_value(APP_NAME_WATCH);
-    }
+    let key = hkcu.open_subkey_with_flags(REG_RUN_PATH, winreg::enums::KEY_WRITE)?;
+    let daemon = key.delete_value(APP_NAME);
+    let watch = key.delete_value(APP_NAME_WATCH);
+    daemon.and(watch)
 }
 
 #[cfg(windows)]
@@ -250,6 +284,96 @@ fn write_exe_with_retry(exe_dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn daemon_version_matches(reported: &str) -> bool {
+    reported.trim() == env!("CARGO_PKG_VERSION")
+}
+
+fn launch_daemon_with_retry(exe_dest: &Path, port: u16) -> Result<String, String> {
+    let mut last_error = String::from("Daemon chưa từng được khởi chạy");
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        match spawn_detached(exe_dest, &["daemon", "--start"]) {
+            Ok(pid) => match probe_health_sync(port, 10) {
+                Some(version) if daemon_version_matches(&version) => {
+                    return Ok(format!(
+                        "daemon v{} đáp ứng health (PID {}, lần thử {})",
+                        version,
+                        pid,
+                        attempt + 1
+                    ));
+                }
+                Some(version) => {
+                    last_error = format!(
+                        "Một daemon phiên bản {} đang giữ cổng {} (bộ cài là {}) — dừng bản cũ rồi cài lại",
+                        version,
+                        port,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
+                None => {
+                    last_error = format!(
+                        "Đã spawn daemon (PID {}) nhưng không đáp ứng health trên cổng {} (lần thử {}/3)",
+                        pid,
+                        port,
+                        attempt + 1
+                    );
+                }
+            },
+            Err(error) => {
+                last_error = error;
+            }
+        }
+    }
+    Err(last_error)
+}
+
+fn write_install_log(steps: &[InstallStep], success: bool) {
+    let Some(app_data) = std::env::var("APPDATA").ok() else {
+        return;
+    };
+    let Some(dir) = safe_join(&app_data, &["GhitaPrint"]) else {
+        return;
+    };
+    let _ = fs::create_dir_all(&dir);
+    let log_path = dir.join("install.log");
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) else {
+        return;
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(
+        file,
+        "[unix {}] setup v{} — {}",
+        timestamp,
+        env!("CARGO_PKG_VERSION"),
+        if success {
+            "THÀNH CÔNG"
+        } else {
+            "THẤT BẠI"
+        }
+    );
+    for step in steps {
+        let _ = writeln!(
+            file,
+            "  {} {} — {}",
+            if step.ok { "[OK] " } else { "[LỖI]" },
+            step.name,
+            step.detail
+        );
+    }
+}
+
+fn hold_console_on_failure() {
+    println!("\nNhấn Enter để đóng cửa sổ này...");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+}
+
 struct InstallStep {
     name: &'static str,
     ok: bool,
@@ -259,7 +383,17 @@ struct InstallStep {
 fn run_install(silent: bool, json_mode: bool) -> Result<Vec<InstallStep>, String> {
     let mut steps: Vec<InstallStep> = Vec::new();
 
-    verify_embedded_payload()?;
+    if let Err(error) = verify_embedded_payload() {
+        write_install_log(
+            &[InstallStep {
+                name: "verify_payload",
+                ok: false,
+                detail: error.clone(),
+            }],
+            false,
+        );
+        return Err(error);
+    }
 
     let install_dir = get_install_dir();
     let exe_dest = install_dir.join("ghitaprint.exe");
@@ -274,10 +408,20 @@ fn run_install(silent: bool, json_mode: bool) -> Result<Vec<InstallStep>, String
         );
     }
 
-    stop_running_instances();
+    stop_running_instances(&install_dir);
 
-    fs::create_dir_all(&install_dir)
-        .map_err(|e| format!("Không thể tạo thư mục cài đặt: {}", e))?;
+    if let Err(error) = fs::create_dir_all(&install_dir) {
+        let detail = format!("Không thể tạo thư mục cài đặt: {}", error);
+        write_install_log(
+            &[InstallStep {
+                name: "create_dir",
+                ok: false,
+                detail: detail.clone(),
+            }],
+            false,
+        );
+        return Err(detail);
+    }
 
     let exe_result = write_exe_with_retry(&exe_dest);
     steps.push(InstallStep {
@@ -288,7 +432,10 @@ fn run_install(silent: bool, json_mode: bool) -> Result<Vec<InstallStep>, String
             Err(e) => e.clone(),
         },
     });
-    exe_result?;
+    if let Err(error) = exe_result {
+        write_install_log(&steps, false);
+        return Err(error);
+    }
 
     #[cfg(windows)]
     let path_result = (|| -> std::io::Result<bool> {
@@ -354,14 +501,7 @@ fn run_install(silent: bool, json_mode: bool) -> Result<Vec<InstallStep>, String
         },
     });
 
-    let daemon_result = spawn_detached(&exe_dest, &["daemon", "--start"]).and_then(|_| {
-        probe_health_sync(configured_port, 10)
-            .map(|version| format!("daemon v{} đáp ứng health", version))
-            .ok_or_else(|| {
-                "Daemon đã spawn nhưng không đáp ứng health — xem logs tại %APPDATA%\\GhitaPrint\\logs"
-                    .to_string()
-            })
-    });
+    let daemon_result = launch_daemon_with_retry(&exe_dest, configured_port);
     let daemon_ok = daemon_result.is_ok();
     steps.push(InstallStep {
         name: "daemon",
@@ -369,9 +509,28 @@ fn run_install(silent: bool, json_mode: bool) -> Result<Vec<InstallStep>, String
         detail: daemon_result.clone().unwrap_or_else(|error| error),
     });
 
+    #[cfg(windows)]
+    let watch_result = (|| -> Result<String, String> {
+        if ghitaprint::watch::is_watch_running() {
+            return Ok("watch đang chạy sẵn".to_string());
+        }
+        if ghitaprint::watch::spawn_hidden_watch_at(&exe_dest, 500, false) {
+            Ok("watch đã khởi chạy ẩn".to_string())
+        } else {
+            Err("Không spawn được watch — sẽ chạy ở lần đăng nhập kế tiếp".to_string())
+        }
+    })();
+    #[cfg(not(windows))]
+    let watch_result: Result<String, String> = Err("Chỉ hỗ trợ Windows".to_string());
+    steps.push(InstallStep {
+        name: "watch",
+        ok: watch_result.is_ok(),
+        detail: watch_result.clone().unwrap_or_else(|error| error),
+    });
+
     let all_critical_ok = steps
         .iter()
-        .filter(|step| matches!(step.name, "extract_exe" | "daemon"))
+        .filter(|step| matches!(step.name, "extract_exe" | "autostart" | "daemon"))
         .all(|step| step.ok);
 
     if json_mode {
@@ -414,8 +573,13 @@ fn run_install(silent: bool, json_mode: bool) -> Result<Vec<InstallStep>, String
     }
 
     if all_critical_ok {
+        write_install_log(&steps, true);
         Ok(steps)
     } else {
+        write_install_log(&steps, false);
+        if !silent && !json_mode {
+            hold_console_on_failure();
+        }
         Err("Cài đặt không hoàn tất".to_string())
     }
 }
@@ -438,14 +602,24 @@ fn run_uninstall(
         );
     }
 
-    stop_running_instances();
+    stop_running_instances(&install_dir);
 
     #[cfg(windows)]
-    uninstall_registry_run();
+    let autostart_result = uninstall_registry_run();
+    #[cfg(windows)]
+    steps.push(InstallStep {
+        name: "autostart",
+        ok: autostart_result.is_ok(),
+        detail: match &autostart_result {
+            Ok(()) => "Registry Run đã gỡ".to_string(),
+            Err(e) => format!("Không gỡ được Registry Run: {}", e),
+        },
+    });
+    #[cfg(not(windows))]
     steps.push(InstallStep {
         name: "autostart",
         ok: true,
-        detail: "Registry Run đã gỡ".to_string(),
+        detail: "Không phải Windows — bỏ qua".to_string(),
     });
 
     #[cfg(windows)]
@@ -453,21 +627,30 @@ fn run_uninstall(
         let current = read_user_path();
         let cleaned = remove_from_path_value(&current, &install_dir.to_string_lossy());
         let path_removed = cleaned != current;
-        if path_removed {
-            let _ = write_user_path(&cleaned);
-            broadcast_environment_change();
-        }
-        delete_installed_marker_env();
+        let path_result = if path_removed {
+            write_user_path(&cleaned).map(|()| broadcast_environment_change())
+        } else {
+            Ok(())
+        };
         steps.push(InstallStep {
             name: "path",
-            ok: true,
-            detail: if path_removed {
-                "Đã gỡ khỏi PATH + xóa biến GHITAPRINT_INSTALLED".to_string()
-            } else {
-                "PATH không có mục GhitaPrint".to_string()
+            ok: path_result.is_ok(),
+            detail: match path_result {
+                Ok(()) if path_removed => {
+                    "Đã gỡ khỏi PATH + xóa biến GHITAPRINT_INSTALLED".to_string()
+                }
+                Ok(()) => "PATH không có mục GhitaPrint".to_string(),
+                Err(e) => format!("Không gỡ được PATH: {}", e),
             },
         });
+        delete_installed_marker_env();
     }
+    #[cfg(not(windows))]
+    steps.push(InstallStep {
+        name: "path",
+        ok: true,
+        detail: "Không phải Windows — bỏ qua".to_string(),
+    });
 
     let printer_result =
         run_powershell_utf8(&ghitaprint::server::virtual_printer::remove_printer_command(true));
@@ -652,5 +835,17 @@ mod tests {
         let fingerprint = payload_fingerprint();
         assert_eq!(fingerprint.len(), 64);
         assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_daemon_version_matches_requires_exact_current_version() {
+        assert!(daemon_version_matches(env!("CARGO_PKG_VERSION")));
+        assert!(daemon_version_matches(&format!(
+            "  {}  ",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(!daemon_version_matches("0.0.3-preview"));
+        assert!(!daemon_version_matches("0.0.2"));
+        assert!(!daemon_version_matches(""));
     }
 }

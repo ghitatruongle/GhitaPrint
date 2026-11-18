@@ -21,13 +21,8 @@ impl UsbPrinterDevice {
     }
 }
 
-const KNOWN_PRINTER_VIDS: &[u16] = &[
-    0x0416, 0x1fc9, 0x04b8, 0x0a5f, 0x04a9, 0x03f0, 0x04f9, 0x1203, 0x0dd4, 0x0fe6, 0x1504, 0x0519,
-    0x20d1, 0x0684,
-];
-
 pub fn classify_device(
-    vendor_id: u16,
+    _vendor_id: u16,
     has_printer_class: bool,
     product: Option<&str>,
     manufacturer: Option<&str>,
@@ -48,9 +43,6 @@ pub fn classify_device(
             || mfg.contains("zebra")
     };
 
-    if KNOWN_PRINTER_VIDS.contains(&vendor_id) {
-        return name_hints();
-    }
     name_hints()
 }
 

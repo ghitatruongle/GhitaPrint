@@ -37,24 +37,81 @@ pub fn printer_port_command() -> String {
     )
 }
 
+pub const POWERSHELL_TIMEOUT_SECS: u64 = 30;
+
 #[cfg(windows)]
 pub fn run_powershell_utf8(script: &str) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+
     let wrapped = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; {}",
         script
     );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &wrapped])
-        .output()
+    let mut child = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &wrapped])
+        .creation_flags(0x08000000)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("Không thể thực thi PowerShell: {}", e))?;
 
-    let mut combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr_text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout_handle = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(POWERSHELL_TIMEOUT_SECS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!(
+                    "Không theo dõi được tiến trình PowerShell: {}",
+                    error
+                ));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "PowerShell không phản hồi sau {} giây — đã buộc dừng (spooler có thể đang treo)",
+                POWERSHELL_TIMEOUT_SECS
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    let stdout_bytes = stdout_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr_bytes = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
     if !stderr_text.is_empty() {
-        combined.push(' ');
-        combined.push_str(&stderr_text);
+        tracing::debug!("PowerShell stderr: {}", stderr_text);
     }
-    Ok(combined.trim().to_string())
+
+    let mut output = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
+    if !status.success() && output.is_empty() {
+        output = format!("PowerShell thoát với mã {:?}", status.code());
+    }
+    Ok(output.trim().to_string())
 }
 
 #[cfg(not(windows))]
